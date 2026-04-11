@@ -1,0 +1,31 @@
+# Copy to e.g. mybench.yaml and edit. Keys use snake_case; hyphens in names are also accepted (e.g. table-size).
+#
+# Required:
+#   url — database connection string (or pass --url on the CLI instead).
+#
+# CLI overrides any key from this file when you pass the matching flag.
+
+url: "postgresql://USER:PASSWORD@HOST:5432/DATABASE"
+
+# Optional (defaults shown in README “参数说明” table)
+workers: 16
+duration: 60.0
+mode: oltp
+select_ratio: 0.65
+insert_ratio: 0.25
+update_ratio: 0.08
+delete_ratio: 0.02
+
+txn_mode: multi
+txn_statements: 7
+txn_select_ratio: 5.0
+txn_insert_ratio: 1.0
+txn_update_ratio: 1.0
+txn_delete_ratio: 1.0
+
+table: sbtest
+tables: 8
+table_size: 10000
+prepare: true
+warmup: 0.0
+report_interval: 5.0
