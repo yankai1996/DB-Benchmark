@@ -1,0 +1,38 @@
+# Template track with custom `sql` strings (PostgreSQL / MySQL compatible examples).
+# Mutually exclusive with workload.mix. Prepare tables first (`prepare --table-size` recommended).
+
+prepare:
+  indexes:
+    - name: created
+      columns: [created_at]
+
+run:
+  update_columns:
+    - payload
+
+workload:
+  transaction:
+    shape: single
+  # Optional: width for template SELECT with two %s (BETWEEN low AND high); default 100.
+  range_size: 100
+  statements:
+    - id: point_select
+      weight: 5.0
+      kind: select
+      sql: "SELECT {select_list} FROM {table} WHERE id = %s"
+    - id: range_select
+      weight: 2.0
+      kind: select
+      sql: "SELECT {select_list} FROM {table} WHERE id BETWEEN %s AND %s"
+    - id: point_update
+      weight: 0.8
+      kind: update
+      sql: "UPDATE {table} SET payload = %s WHERE id = %s"
+    - id: point_delete
+      weight: 1.0
+      kind: delete
+      sql: "DELETE FROM {table} WHERE id = %s"
+    - id: insert_row
+      weight: 1.0
+      kind: insert
+      sql: "INSERT INTO {table} (payload) VALUES (%s)"

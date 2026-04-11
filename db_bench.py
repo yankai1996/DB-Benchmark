@@ -15,11 +15,14 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from bench_model import (
     BenchModel,
     ExtraColumn,
+    StatementTemplate,
+    WorkloadSpec,
     default_bench_model,
     load_bench_model,
 )
@@ -35,12 +38,30 @@ _MAX_INTERVAL_LAT_SAMPLES = 100_000
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MAX_IDENT_LEN = 60
 
-# Defaults for CLI and config file (YAML). Keys use snake_case; YAML may use hyphens (normalized).
+_PKG_ROOT = Path(__file__).resolve().parent
+DEFAULT_MODEL_PATH = str(_PKG_ROOT / "models" / "default.yaml")
+
+# Keys allowed in -c/--config YAML (no workload ratio keys).
+_FILE_CONFIG_ALLOWED_KEYS = frozenset(
+    {
+        "url",
+        "workers",
+        "duration",
+        "table",
+        "tables",
+        "table_size",
+        "warmup",
+        "report_interval",
+        "report_percentile",
+        "model",
+    }
+)
+
+# Full defaults for argparse after merge (ratios overwritten from model workload before parse).
 _PROGRAM_DEFAULTS: Dict[str, object] = {
     "url": None,
     "workers": 8,
     "duration": 30.0,
-    "mode": "oltp",
     "select_ratio": 0.5,
     "insert_ratio": 0.5,
     "update_ratio": 0.0,
@@ -57,10 +78,9 @@ _PROGRAM_DEFAULTS: Dict[str, object] = {
     "warmup": 0.0,
     "report_interval": 0.0,
     "report_percentile": 95.0,
-    "model": None,
+    "model": DEFAULT_MODEL_PATH,
+    "range_size": 100,
 }
-
-_CONFIG_ALLOWED_KEYS = frozenset(_PROGRAM_DEFAULTS.keys())
 
 
 def extract_config_path(argv: List[str]) -> Tuple[Optional[str], List[str]]:
@@ -112,7 +132,7 @@ def normalize_config_mapping(raw: dict) -> dict:
     out: Dict[str, object] = {}
     for k, v in raw.items():
         nk = str(k).replace("-", "_")
-        if nk not in _CONFIG_ALLOWED_KEYS:
+        if nk not in _FILE_CONFIG_ALLOWED_KEYS:
             print(f"Warning: unknown config key ignored: {k!r}", file=sys.stderr)
             continue
         out[nk] = _coerce_config_value(nk, v)
@@ -122,8 +142,82 @@ def normalize_config_mapping(raw: dict) -> dict:
 def merge_config_with_program_defaults(file_cfg: dict) -> dict:
     d = dict(_PROGRAM_DEFAULTS)
     for k, v in file_cfg.items():
+        if k == "model" and (v is None or (isinstance(v, str) and not v.strip())):
+            continue
         d[k] = v
     return d
+
+
+def resolve_bench_model(model_path: str) -> BenchModel:
+    """Load YAML model from path; empty path uses in-memory default (no file)."""
+    raw = (model_path or "").strip()
+    if not raw:
+        return default_bench_model()
+    p = Path(raw)
+    if not p.is_file():
+        raise SystemExit(f"Model file not found: {raw!r}")
+    return load_bench_model(str(p.resolve()))
+
+
+def _aggregate_template_ratios(
+    stmts: Tuple[StatementTemplate, ...],
+) -> Tuple[float, float, float, float]:
+    s = ins = upd = dele = 0.0
+    for t in stmts:
+        if t.kind == "select":
+            s += t.weight
+        elif t.kind == "insert":
+            ins += t.weight
+        elif t.kind == "update":
+            upd += t.weight
+        else:
+            dele += t.weight
+    tot = s + ins + upd + dele
+    if tot <= 0:
+        return (0.25, 0.25, 0.25, 0.25)
+    return (s / tot, ins / tot, upd / tot, dele / tot)
+
+
+def apply_model_workload_to_merged(merged: Dict[str, Any], w: WorkloadSpec) -> None:
+    """Overlay ratio/txn keys from model workload (before CLI parse)."""
+    merged["range_size"] = w.range_size
+    p = _PROGRAM_DEFAULTS
+    if w.statements:
+        s, ins, upd, dele = _aggregate_template_ratios(w.statements)
+        merged["select_ratio"] = s
+        merged["insert_ratio"] = ins
+        merged["update_ratio"] = upd
+        merged["delete_ratio"] = dele
+        merged["txn_select_ratio"] = s
+        merged["txn_insert_ratio"] = ins
+        merged["txn_update_ratio"] = upd
+        merged["txn_delete_ratio"] = dele
+        merged["txn_mode"] = w.shape
+        merged["txn_statements"] = w.statement_count if w.shape == "multi" else p["txn_statements"]
+        return
+
+    if w.shape == "single":
+        merged["select_ratio"] = w.mix_single[0]
+        merged["insert_ratio"] = w.mix_single[1]
+        merged["update_ratio"] = w.mix_single[2]
+        merged["delete_ratio"] = w.mix_single[3]
+        merged["txn_mode"] = "single"
+        merged["txn_statements"] = p["txn_statements"]
+        merged["txn_select_ratio"] = p["txn_select_ratio"]
+        merged["txn_insert_ratio"] = p["txn_insert_ratio"]
+        merged["txn_update_ratio"] = p["txn_update_ratio"]
+        merged["txn_delete_ratio"] = p["txn_delete_ratio"]
+    else:
+        merged["select_ratio"] = w.mix_multi[0]
+        merged["insert_ratio"] = w.mix_multi[1]
+        merged["update_ratio"] = w.mix_multi[2]
+        merged["delete_ratio"] = w.mix_multi[3]
+        merged["txn_mode"] = "multi"
+        merged["txn_statements"] = w.statement_count
+        merged["txn_select_ratio"] = w.mix_multi[0]
+        merged["txn_insert_ratio"] = w.mix_multi[1]
+        merged["txn_update_ratio"] = w.mix_multi[2]
+        merged["txn_delete_ratio"] = w.mix_multi[3]
 
 
 def build_argument_parser(defaults: Dict[str, object]) -> argparse.ArgumentParser:
@@ -159,8 +253,8 @@ def build_argument_parser(defaults: Dict[str, object]) -> argparse.ArgumentParse
 
     parser = argparse.ArgumentParser(
         description="Database load generator (PostgreSQL / MySQL).",
-        epilog="Use -c/--config FILE.yaml for defaults; CLI overrides file. "
-        "See README for config keys.",
+        epilog="Use -c/--config FILE.yaml for connection/scale/reporting/model; workload ratios come "
+        "from the model (overridable on the CLI). See README.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -178,8 +272,7 @@ def build_argument_parser(defaults: Dict[str, object]) -> argparse.ArgumentParse
         "--model",
         default=d["model"],
         metavar="FILE.yaml",
-        help="YAML model: prepare.extra_columns, prepare.indexes, and optional run.* "
-        "(see models/example.yaml); omit for built-in schema",
+        help="YAML model (default: bundled models/default.yaml; see models/example.yaml)",
     )
 
     p_run = sub.add_parser(
@@ -205,17 +298,11 @@ def build_argument_parser(defaults: Dict[str, object]) -> argparse.ArgumentParse
         help="Benchmark duration in seconds (default: %(default)s)",
     )
     p_run.add_argument(
-        "--mode",
-        choices=["oltp", "read", "write"],
-        default=d["mode"],
-        help="oltp: use CRUD ratios below; read: 100%% SELECT; write: 100%% INSERT (default: %(default)s)",
-    )
-    p_run.add_argument(
         "--select-ratio",
         type=float,
         default=d["select_ratio"],
         metavar="W",
-        help="SELECT weight for --txn-mode single / outer mix (default: %(default)s)",
+        help="SELECT weight for --txn-mode single / outer mix (default from model; %(default)s)",
     )
     p_run.add_argument(
         "--insert-ratio",
@@ -280,6 +367,14 @@ def build_argument_parser(defaults: Dict[str, object]) -> argparse.ArgumentParse
         help="Txn-internal DELETE weight (default: %(default)s)",
     )
     p_run.add_argument(
+        "--range-size",
+        type=int,
+        default=d["range_size"],
+        metavar="N",
+        help="Template SELECT with two %%s (BETWEEN): inclusive span length; "
+        "model workload.range_size is merged first (default: %(default)s)",
+    )
+    p_run.add_argument(
         "--warmup",
         type=float,
         default=d["warmup"],
@@ -303,8 +398,7 @@ def build_argument_parser(defaults: Dict[str, object]) -> argparse.ArgumentParse
         "--model",
         default=d["model"],
         metavar="FILE.yaml",
-        help="YAML model: run.update_columns lists columns SET by UPDATE (see models/example.yaml); "
-        "omit for payload-only updates",
+        help="YAML model (default: bundled models/default.yaml); prepare/run, workload, run.update_columns",
     )
 
     p_clean = sub.add_parser(
@@ -418,6 +512,8 @@ class BenchConfig:
     report_percentile: float
     update_columns: Tuple[str, ...]
     extra_columns: Tuple[ExtraColumn, ...]
+    statement_templates: Tuple[StatementTemplate, ...] = field(default_factory=tuple)
+    range_size: int = 100
 
 
 @dataclass
@@ -475,6 +571,17 @@ def normalize_crud_ratios(s: float, ins: float, upd: float, dele: float) -> Tupl
     if t <= 0:
         raise SystemExit("At least one CRUD ratio must be > 0")
     return (s / t, ins / t, upd / t, dele / t)
+
+
+def workload_shape_from_normalized_crud(
+    s: float, ins: float, upd: float, dele: float, *, eps: float = 1e-9
+) -> str:
+    """read | write | oltp after normalization."""
+    if ins <= eps and upd <= eps and dele <= eps and s > eps:
+        return "read"
+    if s <= eps and upd <= eps and dele <= eps and ins > eps:
+        return "write"
+    return "oltp"
 
 
 def physical_table_names(stem: str, num_tables: int) -> List[str]:
@@ -542,6 +649,176 @@ def _pick_crud_op(u: float, crud: Tuple[float, float, float, float]) -> str:
     return "delete"
 
 
+def _pick_statement_template(
+    u: float, templates: Tuple[StatementTemplate, ...]
+) -> StatementTemplate:
+    tot = sum(t.weight for t in templates)
+    if tot <= 0:
+        raise SystemExit("internal error: template weights sum to 0")
+    r = u * tot
+    for t in templates:
+        r -= t.weight
+        if r <= 0:
+            return t
+    return templates[-1]
+
+
+def _count_s_placeholders(sql: str) -> int:
+    """Count DB-API ``%s`` placeholders; treat ``%%`` as a literal percent."""
+    n = 0
+    i = 0
+    while i < len(sql):
+        if i + 1 < len(sql) and sql[i] == "%" and sql[i + 1] == "s":
+            n += 1
+            i += 2
+            continue
+        if i + 1 < len(sql) and sql[i] == "%" and sql[i + 1] == "%":
+            i += 2
+            continue
+        i += 1
+    return n
+
+
+def _resolve_template_rid(
+    tbl: str,
+    pk_hi: Dict[str, int],
+    randint: Callable[[int, int], int],
+    fixed_rid: Optional[int],
+) -> Optional[int]:
+    top = pk_hi.get(tbl, 0)
+    if fixed_rid is not None:
+        return fixed_rid
+    if top >= 1:
+        return randint(1, top)
+    return None
+
+
+def _template_range_bounds(
+    randint: Callable[[int, int], int],
+    top: int,
+    range_size: int,
+) -> Tuple[int, int]:
+    """Inclusive [lo, hi] within [1, top], length up to ``range_size`` (sysbench-style)."""
+    rs = max(1, int(range_size))
+    if top < 1:
+        raise RuntimeError("internal: range bounds need top >= 1")
+    if top <= rs:
+        return (1, top)
+    lo = randint(1, top - rs + 1)
+    return (lo, lo + rs - 1)
+
+
+def _update_pk_hi_after_insert(cur, tbl: str, pk_hi: Dict[str, int]) -> None:
+    lr = getattr(cur, "lastrowid", None)
+    if lr:
+        pk_hi[tbl] = max(pk_hi.get(tbl, 0), int(lr))
+        return
+    desc = getattr(cur, "description", None)
+    if desc:
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            pk_hi[tbl] = max(pk_hi.get(tbl, 0), int(row[0]))
+
+
+def execute_statement_template(
+    cur,
+    tmpl: StatementTemplate,
+    tbl: str,
+    pk_hi: Dict[str, int],
+    randint: Callable[[int, int], int],
+    fixed_rid: Optional[int],
+    select_list_sql: str,
+    workload_range_size: int,
+) -> None:
+    """Run custom template SQL (``tmpl.sql`` non-empty). See README."""
+    assert tmpl.sql
+    sql = tmpl.sql.replace("{table}", tbl).replace("{select_list}", select_list_sql)
+    nph = _count_s_placeholders(sql)
+    rid = _resolve_template_rid(tbl, pk_hi, randint, fixed_rid)
+    payload = f"w{threading.get_ident()}-{time.time_ns()}"
+    pl_update = f"u{threading.get_ident()}-{time.time_ns()}"
+
+    if tmpl.kind == "select":
+        if nph == 0:
+            cur.execute(sql)
+        elif nph == 1:
+            if rid is None:
+                raise RuntimeError(
+                    f"template SQL uses %s for id but table {tbl!r} has no rows yet "
+                    f"(prepare with --table-size > 0), or use SQL without %s"
+                )
+            cur.execute(sql, (rid,))
+        elif nph == 2:
+            top = pk_hi.get(tbl, 0)
+            if top < 1:
+                raise RuntimeError(
+                    f"template range SELECT needs at least one row in {tbl!r} "
+                    f"(prepare with --table-size > 0), or use 0/1 %s"
+                )
+            eff_rs = tmpl.range_size if tmpl.range_size is not None else workload_range_size
+            lo, hi = _template_range_bounds(randint, top, eff_rs)
+            cur.execute(sql, (lo, hi))
+        else:
+            raise RuntimeError(
+                f"workload statement {tmpl.id!r}: custom select SQL must use 0, 1, or 2 %s "
+                f"placeholder(s) (2 for BETWEEN low/high), got {nph}"
+            )
+        cur.fetchone()
+        return
+
+    if tmpl.kind == "insert":
+        if nph == 0:
+            cur.execute(sql)
+        elif nph == 1:
+            cur.execute(sql, (payload,))
+        else:
+            raise RuntimeError(
+                f"workload statement {tmpl.id!r}: custom insert SQL must use 0 or 1 %s placeholder(s), "
+                f"got {nph}"
+            )
+        _update_pk_hi_after_insert(cur, tbl, pk_hi)
+        return
+
+    if tmpl.kind == "update":
+        if nph == 0:
+            cur.execute(sql)
+        elif nph == 1:
+            if rid is None:
+                raise RuntimeError(
+                    f"template SQL uses %s for id but table {tbl!r} has no rows yet "
+                    f"(prepare with --table-size > 0), or use SQL without %s"
+                )
+            cur.execute(sql, (rid,))
+        elif nph == 2:
+            if rid is None:
+                raise RuntimeError(
+                    f"template SQL uses two %s placeholders (payload, id) but table {tbl!r} has "
+                    f"no rows yet (prepare with --table-size > 0)"
+                )
+            cur.execute(sql, (pl_update, rid))
+        else:
+            raise RuntimeError(
+                f"workload statement {tmpl.id!r}: custom update SQL must use 0, 1, or 2 %s "
+                f"placeholders (payload, id when 2), got {nph}"
+            )
+        return
+
+    if nph == 0:
+        cur.execute(sql)
+    elif nph == 1:
+        if rid is None:
+            raise RuntimeError(
+                f"template SQL uses %s for id but table {tbl!r} has no rows yet "
+                f"(prepare with --table-size > 0), or use SQL without %s"
+            )
+        cur.execute(sql, (rid,))
+    else:
+        raise RuntimeError(
+            f"workload statement {tmpl.id!r}: custom delete SQL must use 0 or 1 %s placeholder(s), "
+            f"got {nph}"
+        )
+
+
 def worker_loop(
     backend: Backend,
     kwargs: dict,
@@ -556,6 +833,8 @@ def worker_loop(
     live: Optional[LiveStats] = None,
     update_columns: Tuple[str, ...] = ("payload",),
     extra_columns: Tuple[ExtraColumn, ...] = (),
+    statement_templates: Tuple[StatementTemplate, ...] = (),
+    range_size: int = 100,
 ) -> None:
     conn = None
     connect_fail_streak = 0
@@ -578,6 +857,7 @@ def worker_loop(
     select_list_sql = workload_select_columns(update_columns)
     nt = len(table_names)
     txn_multi = txn_mode == "multi"
+    use_templates = len(statement_templates) > 0
     connection_lost = False
 
     try:
@@ -594,7 +874,6 @@ def worker_loop(
                     connection_lost = False
                 except Exception:
                     connect_fail_streak += 1
-                    # Back off so many workers do not busy-spin while the server is down.
                     delay = min(1.0, 0.05 * (2 ** min(connect_fail_streak, 6)))
                     time.sleep(delay)
                     continue
@@ -610,34 +889,88 @@ def worker_loop(
                     txn_rid = randint(1, ttop) if ttop >= 1 else None
                     stmt_ops: List[str] = []
                     for _ in range(txn_statements):
-                        op = _pick_crud_op(rand(), txn_crud)
+                        if use_templates:
+                            tmpl = _pick_statement_template(rand(), statement_templates)
+                            op = tmpl.kind
+                            if tmpl.sql:
+                                execute_statement_template(
+                                    cur,
+                                    tmpl,
+                                    tbl,
+                                    pk_hi,
+                                    randint,
+                                    txn_rid,
+                                    select_list_sql,
+                                    range_size,
+                                )
+                            else:
+                                backend.execute_workload_statement(
+                                    cur,
+                                    op,
+                                    tbl,
+                                    pk_hi,
+                                    randint,
+                                    txn_rid,
+                                    update_columns,
+                                    extra_by_name,
+                                    select_list_sql,
+                                )
+                        else:
+                            op = _pick_crud_op(rand(), txn_crud)
+                            backend.execute_workload_statement(
+                                cur,
+                                op,
+                                tbl,
+                                pk_hi,
+                                randint,
+                                txn_rid,
+                                update_columns,
+                                extra_by_name,
+                                select_list_sql,
+                            )
+                        stmt_ops.append(op)
+                    conn.commit()
+                else:
+                    tbl = table_names[randint(0, nt - 1)]
+                    if use_templates:
+                        tmpl = _pick_statement_template(rand(), statement_templates)
+                        op = tmpl.kind
+                        if tmpl.sql:
+                            execute_statement_template(
+                                cur,
+                                tmpl,
+                                tbl,
+                                pk_hi,
+                                randint,
+                                None,
+                                select_list_sql,
+                                range_size,
+                            )
+                        else:
+                            backend.execute_workload_statement(
+                                cur,
+                                op,
+                                tbl,
+                                pk_hi,
+                                randint,
+                                None,
+                                update_columns,
+                                extra_by_name,
+                                select_list_sql,
+                            )
+                    else:
+                        op = _pick_crud_op(rand(), crud)
                         backend.execute_workload_statement(
                             cur,
                             op,
                             tbl,
                             pk_hi,
                             randint,
-                            txn_rid,
+                            None,
                             update_columns,
                             extra_by_name,
                             select_list_sql,
                         )
-                        stmt_ops.append(op)
-                    conn.commit()
-                else:
-                    op = _pick_crud_op(rand(), crud)
-                    tbl = table_names[randint(0, nt - 1)]
-                    backend.execute_workload_statement(
-                        cur,
-                        op,
-                        tbl,
-                        pk_hi,
-                        randint,
-                        None,
-                        update_columns,
-                        extra_by_name,
-                        select_list_sql,
-                    )
                     if backend.commit_after_each_statement_single_mode():
                         conn.commit()
                 ms = (time.perf_counter() - t0) * 1000.0
@@ -805,6 +1138,8 @@ def run_bench(cfg: BenchConfig) -> WorkerResult:
                     None,
                     cfg.update_columns,
                     cfg.extra_columns,
+                    cfg.statement_templates,
+                    cfg.range_size,
                 )
                 for i in range(cfg.workers)
             ]
@@ -857,6 +1192,8 @@ def run_bench(cfg: BenchConfig) -> WorkerResult:
                     live,
                     cfg.update_columns,
                     cfg.extra_columns,
+                    cfg.statement_templates,
+                    cfg.range_size,
                 )
                 for i in range(cfg.workers)
             ]
@@ -914,9 +1251,7 @@ def cmd_prepare(args: argparse.Namespace) -> None:
     table_names = physical_table_names(args.table, args.tables)
     conn = backend.connect(kwargs)
     try:
-        model: Optional[BenchModel] = None
-        if args.model:
-            model = load_bench_model(str(args.model))
+        model = resolve_bench_model(str(args.model))
         prepare_benchmark(conn, backend, table_names, args.table_size, model=model)
     finally:
         conn.close()
@@ -949,23 +1284,23 @@ def cmd_run(args: argparse.Namespace) -> None:
         raise SystemExit("--txn-statements must be >= 1 when --txn-mode multi")
     if not 0 < args.report_percentile <= 100:
         raise SystemExit("--report-percentile must be in (0, 100]")
+    if args.range_size < 1:
+        raise SystemExit("--range-size must be >= 1")
 
-    if args.mode == "read":
-        s, ins, upd, dele = 1.0, 0.0, 0.0, 0.0
-    elif args.mode == "write":
-        s, ins, upd, dele = 0.0, 1.0, 0.0, 0.0
-    else:
-        s, ins, upd, dele = (
-            args.select_ratio,
-            args.insert_ratio,
-            args.update_ratio,
-            args.delete_ratio,
-        )
+    bench_model = resolve_bench_model(str(args.model))
+
+    s, ins, upd, dele = (
+        args.select_ratio,
+        args.insert_ratio,
+        args.update_ratio,
+        args.delete_ratio,
+    )
     s, ins, upd, dele = normalize_crud_ratios(s, ins, upd, dele)
+    workload_shape = workload_shape_from_normalized_crud(s, ins, upd, dele)
 
-    if args.mode == "read":
+    if workload_shape == "read":
         ts, tins, tupd, tdel = 1.0, 0.0, 0.0, 0.0
-    elif args.mode == "write":
+    elif workload_shape == "write":
         ts, tins, tupd, tdel = 0.0, 1.0, 0.0, 0.0
     else:
         ts, tins, tupd, tdel = (
@@ -975,11 +1310,6 @@ def cmd_run(args: argparse.Namespace) -> None:
             args.txn_delete_ratio,
         )
     ts, tins, tupd, tdel = normalize_crud_ratios(ts, tins, tupd, tdel)
-
-    if args.model:
-        bench_model = load_bench_model(str(args.model))
-    else:
-        bench_model = default_bench_model()
 
     cfg = BenchConfig(
         url=_require_db_url(args.url),
@@ -1003,19 +1333,25 @@ def cmd_run(args: argparse.Namespace) -> None:
         report_percentile=args.report_percentile,
         update_columns=bench_model.run_update_columns,
         extra_columns=bench_model.extra_columns,
+        statement_templates=bench_model.workload.statements,
+        range_size=args.range_size,
     )
 
     total = run_bench(cfg)
     measure_sec = cfg.duration_sec if cfg.warmup_sec == 0 else cfg.duration_sec
-    if args.mode == "oltp":
+    if workload_shape == "oltp":
         wl = (
             f"workload: oltp crud="
             f"sel={s:.3f} ins={ins:.3f} upd={upd:.3f} del={dele:.3f}"
         )
-    elif args.mode == "read":
+    elif workload_shape == "read":
         wl = "workload: read-only (select=1)"
     else:
         wl = "workload: write-only (insert=1)"
+    if bench_model.workload.statements:
+        wl += f" | track=templates slots={len(bench_model.workload.statements)}"
+    else:
+        wl += " | track=mix"
     wl += f" | txn_mode={cfg.txn_mode}"
     if cfg.txn_mode == "multi":
         wl += (
@@ -1026,8 +1362,13 @@ def cmd_run(args: argparse.Namespace) -> None:
         f" | tables={cfg.tables} table_size={cfg.table_size} "
         f"(stem={cfg.table!r})"
     )
-    if args.model:
-        wl += f" | model={args.model!r} update_cols={list(cfg.update_columns)}"
+    try:
+        _mp = Path(args.model).resolve()
+        _dp = Path(DEFAULT_MODEL_PATH).resolve()
+        m_disp = "default" if _mp == _dp else str(args.model)
+    except OSError:
+        m_disp = str(args.model)
+    wl += f" | model={m_disp!r} update_cols={list(cfg.update_columns)}"
     if cfg.txn_mode == "multi":
         wl += " | note: each transaction contains multiple SQLs; TPS counts commits"
     print_report(total, measure_sec, wl)
@@ -1038,7 +1379,9 @@ def main() -> None:
     file_cfg: dict = {}
     if cfg_path:
         file_cfg = normalize_config_mapping(load_config_file(cfg_path))
-    merged = merge_config_with_program_defaults(file_cfg)
+    merged: Dict[str, Any] = merge_config_with_program_defaults(file_cfg)
+    bm = resolve_bench_model(str(merged.get("model") or ""))
+    apply_model_workload_to_merged(merged, bm.workload)
     args = build_argument_parser(merged).parse_args(argv_rest)
     if args.command == "prepare":
         cmd_prepare(args)

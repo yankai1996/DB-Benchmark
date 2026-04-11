@@ -1,4 +1,4 @@
-"""YAML model for `prepare --model` / `run --model`: DDL, indexes, and run.update_columns."""
+"""YAML model for `prepare --model` / `run --model`: DDL, indexes, run.update_columns, workload.*."""
 
 from __future__ import annotations
 
@@ -43,6 +43,40 @@ class IndexSpec:
 
 
 @dataclass(frozen=True)
+class StatementTemplate:
+    """Weighted statement slot for template track (builtin SQL per kind, or custom sql)."""
+
+    id: str
+    weight: float
+    kind: str  # select | insert | update | delete
+    sql: Optional[str]
+    range_size: Optional[int]  # select + 2x %s: override workload.range_size for BETWEEN width
+
+
+@dataclass(frozen=True)
+class WorkloadSpec:
+    """Transaction shape + either mix weights or statement templates (mutually exclusive)."""
+
+    shape: str  # single | multi
+    statement_count: int  # used when shape == multi (>= 1)
+    mix_single: Tuple[float, float, float, float]  # select, insert, update, delete
+    mix_multi: Tuple[float, float, float, float]
+    statements: Tuple[StatementTemplate, ...]  # non-empty => template track
+    range_size: int  # template SELECT with two %s (BETWEEN low/high); default 100 (sysbench-like)
+
+
+def default_workload_spec() -> WorkloadSpec:
+    return WorkloadSpec(
+        shape="single",
+        statement_count=7,
+        mix_single=(0.5, 0.5, 0.0, 0.0),
+        mix_multi=(5.0, 1.0, 1.0, 1.0),
+        statements=(),
+        range_size=100,
+    )
+
+
+@dataclass(frozen=True)
 class BenchModel:
     """prepare DDL plus run workload; run_extensions stores unknown keys under `run` for future use."""
 
@@ -50,6 +84,7 @@ class BenchModel:
     indexes: Tuple[IndexSpec, ...]
     run_update_columns: Tuple[str, ...]
     run_extensions: Tuple[Tuple[str, Any], ...]
+    workload: WorkloadSpec
 
 
 def default_bench_model() -> BenchModel:
@@ -58,7 +93,152 @@ def default_bench_model() -> BenchModel:
         indexes=(),
         run_update_columns=("payload",),
         run_extensions=(),
+        workload=default_workload_spec(),
     )
+
+
+def _parse_mix_weights(raw: object, where: str) -> Tuple[float, float, float, float]:
+    if not isinstance(raw, dict):
+        raise SystemExit(f"{where}: must be a mapping")
+    out: List[float] = []
+    for k in ("select", "insert", "update", "delete"):
+        v = raw.get(k)
+        if v is None:
+            raise SystemExit(f"{where}.{k} is required")
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise SystemExit(f"{where}.{k} must be a number")
+        if v < 0:
+            raise SystemExit(f"{where}.{k} must be >= 0")
+        out.append(float(v))
+    if sum(out) <= 0:
+        raise SystemExit(f"{where}: at least one of select/insert/update/delete must be > 0")
+    return (out[0], out[1], out[2], out[3])
+
+
+def _coerce_pos_int(name: str, raw: object) -> int:
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise SystemExit(f"{name} must be an integer")
+    if isinstance(raw, float) and not raw.is_integer():
+        raise SystemExit(f"{name} must be an integer")
+    n = int(raw)
+    if n < 1:
+        raise SystemExit(f"{name} must be >= 1")
+    return n
+
+
+def _parse_workload_range_size(raw: object) -> int:
+    """Default 100 when omitted (aligns with common sysbench --range-size)."""
+    if raw is None:
+        return 100
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise SystemExit("workload.range_size must be an integer")
+    if isinstance(raw, float) and not raw.is_integer():
+        raise SystemExit("workload.range_size must be an integer")
+    n = int(raw)
+    if n < 1:
+        raise SystemExit("workload.range_size must be >= 1")
+    return n
+
+
+def _parse_statement_template(raw: object, idx: int) -> StatementTemplate:
+    if not isinstance(raw, dict):
+        raise SystemExit(f"workload.statements[{idx}] must be a mapping")
+    tid = raw.get("id")
+    if not isinstance(tid, str) or not tid.strip():
+        raise SystemExit(f"workload.statements[{idx}].id is required")
+    w = raw.get("weight")
+    if isinstance(w, bool) or not isinstance(w, (int, float)):
+        raise SystemExit(f"workload.statements[{idx}].weight must be a number")
+    if w < 0:
+        raise SystemExit(f"workload.statements[{idx}].weight must be >= 0")
+    kind_raw = raw.get("kind")
+    if not isinstance(kind_raw, str) or not kind_raw.strip():
+        raise SystemExit(f"workload.statements[{idx}].kind is required")
+    kind = kind_raw.strip().lower()
+    if kind not in ("select", "insert", "update", "delete"):
+        raise SystemExit(
+            f"workload.statements[{idx}].kind must be select, insert, update, or delete "
+            f"(got {kind_raw!r})"
+        )
+    sql_raw = raw.get("sql")
+    sql: Optional[str]
+    if sql_raw is None or sql_raw == "":
+        sql = None
+    elif isinstance(sql_raw, str):
+        s = sql_raw.strip()
+        sql = None if not s else s
+    else:
+        raise SystemExit(f"workload.statements[{idx}].sql must be a string or omitted")
+    rs_stmt: Optional[int] = None
+    if raw.get("range_size") is not None:
+        rs_stmt = _coerce_pos_int(f"workload.statements[{idx}].range_size", raw.get("range_size"))
+    return StatementTemplate(tid.strip(), float(w), kind, sql, rs_stmt)
+
+
+def parse_workload(raw: object) -> WorkloadSpec:
+    """Parse optional top-level `workload` block; missing or {} uses defaults."""
+    if raw is None or raw == {}:
+        return default_workload_spec()
+    if not isinstance(raw, dict):
+        raise SystemExit("workload: must be a mapping")
+
+    tx = raw.get("transaction")
+    if not isinstance(tx, dict):
+        raise SystemExit("workload.transaction is required (mapping)")
+
+    shape_raw = tx.get("shape")
+    if not isinstance(shape_raw, str) or not shape_raw.strip():
+        raise SystemExit("workload.transaction.shape must be 'single' or 'multi'")
+    shape = shape_raw.strip().lower()
+    if shape not in ("single", "multi"):
+        raise SystemExit("workload.transaction.shape must be 'single' or 'multi'")
+
+    stmts_raw = raw.get("statements")
+    has_nonempty_statements = isinstance(stmts_raw, list) and len(stmts_raw) > 0
+    if stmts_raw is not None and not isinstance(stmts_raw, list):
+        raise SystemExit("workload.statements must be a list")
+
+    d = default_workload_spec()
+    wrs = _parse_workload_range_size(raw.get("range_size"))
+
+    if has_nonempty_statements:
+        if "mix" in raw:
+            raise SystemExit(
+                "workload.mix must not appear when workload.statements is non-empty "
+                "(use mix track or template track, not both)"
+            )
+        templates = tuple(_parse_statement_template(x, i) for i, x in enumerate(stmts_raw))
+        tw = sum(t.weight for t in templates)
+        if tw <= 0:
+            raise SystemExit("workload.statements: sum of weights must be > 0")
+        if shape == "single":
+            if "statement_count" in tx:
+                raise SystemExit("workload.transaction.statement_count is not allowed when shape is single")
+            return WorkloadSpec("single", d.statement_count, d.mix_single, d.mix_multi, templates, wrs)
+        n_st = _coerce_pos_int("workload.transaction.statement_count", tx.get("statement_count"))
+        return WorkloadSpec("multi", n_st, d.mix_single, d.mix_multi, templates, wrs)
+
+    mix = raw.get("mix")
+    if not isinstance(mix, dict):
+        raise SystemExit("workload.mix is required when workload.statements is absent or empty")
+
+    if shape == "single":
+        if "multi" in mix:
+            raise SystemExit("workload.mix.multi is not allowed when transaction.shape is single")
+        if "single" not in mix:
+            raise SystemExit("workload.mix.single is required when transaction.shape is single")
+        ms = _parse_mix_weights(mix["single"], "workload.mix.single")
+        if "statement_count" in tx:
+            raise SystemExit("workload.transaction.statement_count is not allowed when shape is single")
+        return WorkloadSpec("single", d.statement_count, ms, d.mix_multi, (), wrs)
+
+    if "single" in mix:
+        raise SystemExit("workload.mix.single is not allowed when transaction.shape is multi")
+    if "multi" not in mix:
+        raise SystemExit("workload.mix.multi is required when transaction.shape is multi")
+    mm = _parse_mix_weights(mix["multi"], "workload.mix.multi")
+    n_st = _coerce_pos_int("workload.transaction.statement_count", tx.get("statement_count"))
+    return WorkloadSpec("multi", n_st, d.mix_single, mm, (), wrs)
 
 
 def _load_yaml(path: str) -> dict:
@@ -167,6 +347,12 @@ def _parse_run_section(
     if not isinstance(run_raw, dict):
         raise SystemExit("run: must be a mapping when present")
 
+    if run_raw.get("mode") is not None:
+        raise SystemExit(
+            "run.mode is removed; set workload in the model YAML (workload.mix / workload.statements) "
+            "and use run CLI flags to override ratios when needed."
+        )
+
     known = frozenset({"update_columns"})
     ext_items: List[Tuple[str, Any]] = []
     for k, v in run_raw.items():
@@ -247,11 +433,14 @@ def load_bench_model(path: str) -> BenchModel:
     run_raw = data.get("run")
     run_update_columns, run_extensions = _parse_run_section(run_raw, extras)
 
+    workload = parse_workload(data.get("workload"))
+
     return BenchModel(
         extra_columns=extras,
         indexes=indexes,
         run_update_columns=run_update_columns,
         run_extensions=run_extensions,
+        workload=workload,
     )
 
 

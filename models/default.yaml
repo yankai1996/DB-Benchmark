@@ -1,0 +1,21 @@
+# Default model (bundled next to db_bench.py). Overridden by --model / config `model`.
+# workload: single-statement transactions, 50/50 read/write mix (same as program defaults).
+
+prepare:
+  indexes:
+    - name: created
+      columns: [created_at]
+
+run:
+  update_columns:
+    - payload
+
+workload:
+  transaction:
+    shape: single
+  mix:
+    single:
+      select: 0.5
+      insert: 0.5
+      update: 0.0
+      delete: 0.0

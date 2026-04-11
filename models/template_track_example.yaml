@@ -1,0 +1,23 @@
+# Example: template track — weighted slots per `kind`. Omit `sql` for built-in statements, or set `sql`
+# for custom SQL (see README and models/template_custom_sql_example.yaml).
+# Mutually exclusive with workload.mix.
+
+prepare:
+  indexes:
+    - name: created
+      columns: [created_at]
+
+run:
+  update_columns:
+    - payload
+
+workload:
+  transaction:
+    shape: single
+  statements:
+    - id: mostly_select
+      weight: 8.0
+      kind: select
+    - id: occasional_insert
+      weight: 2.0
+      kind: insert
