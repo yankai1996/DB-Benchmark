@@ -4,6 +4,9 @@
 #   url — database connection string (or pass --url on the CLI instead).
 #
 # CLI overrides any key from this file when you pass the matching flag.
+# First run:  python3 db_bench.py -c thisfile.yaml prepare
+# Benchmark:  python3 db_bench.py -c thisfile.yaml run
+# Tear down:   python3 db_bench.py -c thisfile.yaml cleanup
 
 url: "postgresql://USER:PASSWORD@HOST:5432/DATABASE"
 
@@ -26,6 +29,6 @@ txn_delete_ratio: 1.0
 table: sbtest
 tables: 8
 table_size: 10000
-prepare: true
 warmup: 0.0
 report_interval: 5.0
+report_percentile: 95.0

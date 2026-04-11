@@ -16,7 +16,8 @@ import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from itertools import chain
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # --- drivers (import lazily after URL check) ---
 
@@ -52,9 +53,9 @@ _PROGRAM_DEFAULTS: Dict[str, object] = {
     "table": "db_bench_load",
     "tables": 1,
     "table_size": 0,
-    "prepare": False,
     "warmup": 0.0,
     "report_interval": 0.0,
+    "report_percentile": 95.0,
 }
 
 _CONFIG_ALLOWED_KEYS = frozenset(_PROGRAM_DEFAULTS.keys())
@@ -85,10 +86,6 @@ def extract_config_path(argv: List[str]) -> Tuple[Optional[str], List[str]]:
 
 
 def _coerce_config_value(key: str, val: object) -> object:
-    if key == "prepare":
-        if isinstance(val, str):
-            return val.strip().lower() in ("1", "true", "yes", "on")
-        return bool(val)
     return val
 
 
@@ -128,178 +125,241 @@ def merge_config_with_program_defaults(file_cfg: dict) -> dict:
 
 
 def build_argument_parser(defaults: Dict[str, object]) -> argparse.ArgumentParser:
+    """CLI: subcommands prepare | run | cleanup; --url on each (via shared parent)."""
     d = defaults
-    p = argparse.ArgumentParser(
-        description="Simple DB load test (PostgreSQL / MySQL).",
-        epilog="Required: database URL via --url or config key 'url'. "
-        "Use -c/--config FILE.yaml to load options; CLI overrides file. "
-        "See README for all keys and defaults.",
-    )
-    p.add_argument(
+
+    parent_url = argparse.ArgumentParser(add_help=False)
+    parent_url.add_argument(
         "--url",
         default=d["url"],
         help="Database URL (required if not set in config file)",
     )
-    p.add_argument(
+
+    def add_table_args(p: argparse.ArgumentParser, *, table_size_help: str) -> None:
+        p.add_argument(
+            "--table",
+            default=d["table"],
+            help="Table name or stem (default: %(default)s)",
+        )
+        p.add_argument(
+            "--tables",
+            type=int,
+            default=d["tables"],
+            help="Number of tables (default: %(default)s)",
+        )
+        p.add_argument(
+            "--table-size",
+            type=int,
+            default=d["table_size"],
+            metavar="N",
+            help=table_size_help,
+        )
+
+    parser = argparse.ArgumentParser(
+        description="Database load generator (PostgreSQL / MySQL).",
+        epilog="Use -c/--config FILE.yaml for defaults; CLI overrides file. "
+        "See README for config keys.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_prep = sub.add_parser(
+        "prepare",
+        parents=[parent_url],
+        help="Create benchmark tables/indexes and optionally load rows.",
+    )
+    add_table_args(
+        p_prep,
+        table_size_help="If >0, insert this many rows per table when the table is empty "
+        "(default: %(default)s)",
+    )
+
+    p_run = sub.add_parser(
+        "run",
+        parents=[parent_url],
+        help="Run the benchmark (does not create or drop tables).",
+    )
+    add_table_args(
+        p_run,
+        table_size_help="Initial row-count hint per table for point lookups (match prepare fill; "
+        "default: %(default)s)",
+    )
+    p_run.add_argument(
         "--workers",
         type=int,
         default=d["workers"],
         help="Concurrent client threads (default: %(default)s)",
     )
-    p.add_argument(
+    p_run.add_argument(
         "--duration",
         type=float,
         default=d["duration"],
         help="Benchmark duration in seconds (default: %(default)s)",
     )
-    p.add_argument(
+    p_run.add_argument(
         "--mode",
         choices=["oltp", "read", "write"],
         default=d["mode"],
         help="oltp: use CRUD ratios below; read: 100%% SELECT; write: 100%% INSERT (default: %(default)s)",
     )
-    p.add_argument(
+    p_run.add_argument(
         "--select-ratio",
         type=float,
         default=d["select_ratio"],
         metavar="W",
         help="SELECT weight for --txn-mode single / outer mix (default: %(default)s)",
     )
-    p.add_argument(
+    p_run.add_argument(
         "--insert-ratio",
         type=float,
         default=d["insert_ratio"],
         metavar="W",
         help="INSERT weight (default: %(default)s)",
     )
-    p.add_argument(
+    p_run.add_argument(
         "--update-ratio",
         type=float,
         default=d["update_ratio"],
         metavar="W",
         help="UPDATE weight (default: %(default)s)",
     )
-    p.add_argument(
+    p_run.add_argument(
         "--delete-ratio",
         type=float,
         default=d["delete_ratio"],
         metavar="W",
         help="DELETE weight (default: %(default)s)",
     )
-    p.add_argument(
+    p_run.add_argument(
         "--txn-mode",
         choices=["single", "multi"],
         default=d["txn_mode"],
         help="single or multi-statement transactions (default: %(default)s)",
     )
-    p.add_argument(
+    p_run.add_argument(
         "--txn-statements",
         type=int,
         default=d["txn_statements"],
         metavar="N",
         help="Statements per transaction when --txn-mode multi (default: %(default)s)",
     )
-    p.add_argument(
+    p_run.add_argument(
         "--txn-select-ratio",
         type=float,
         default=d["txn_select_ratio"],
         metavar="W",
         help="Txn-internal SELECT weight (default: %(default)s)",
     )
-    p.add_argument(
+    p_run.add_argument(
         "--txn-insert-ratio",
         type=float,
         default=d["txn_insert_ratio"],
         metavar="W",
         help="Txn-internal INSERT weight (default: %(default)s)",
     )
-    p.add_argument(
+    p_run.add_argument(
         "--txn-update-ratio",
         type=float,
         default=d["txn_update_ratio"],
         metavar="W",
         help="Txn-internal UPDATE weight (default: %(default)s)",
     )
-    p.add_argument(
+    p_run.add_argument(
         "--txn-delete-ratio",
         type=float,
         default=d["txn_delete_ratio"],
         metavar="W",
         help="Txn-internal DELETE weight (default: %(default)s)",
     )
-    p.add_argument(
-        "--table",
-        default=d["table"],
-        help="Table name or stem (default: %(default)s)",
-    )
-    p.add_argument(
-        "--tables",
-        type=int,
-        default=d["tables"],
-        help="Number of tables (default: %(default)s)",
-    )
-    p.add_argument(
-        "--table-size",
-        type=int,
-        default=d["table_size"],
-        metavar="N",
-        help="Rows per table on --prepare if empty (default: %(default)s)",
-    )
-    p.add_argument(
-        "--prepare",
-        action="store_true",
-        default=d["prepare"],
-        help="Create benchmark tables/indexes if missing",
-    )
-    p.add_argument(
-        "--no-prepare",
-        action="store_true",
-        help="Force prepare off (overrides config and --prepare)",
-    )
-    p.add_argument(
+    p_run.add_argument(
         "--warmup",
         type=float,
         default=d["warmup"],
         help="Warmup seconds before measured run (default: %(default)s)",
     )
-    p.add_argument(
+    p_run.add_argument(
         "--report-interval",
         type=float,
         default=d["report_interval"],
         metavar="SEC",
         help="Print stats every SEC seconds; 0 disables (default: %(default)s)",
     )
-    return p
+    p_run.add_argument(
+        "--report-percentile",
+        type=float,
+        default=d["report_percentile"],
+        metavar="P",
+        help="Latency percentile in periodic lines (sysbench-style; default: %(default)s)",
+    )
+
+    p_clean = sub.add_parser(
+        "cleanup",
+        parents=[parent_url],
+        help="Drop benchmark tables (IF EXISTS).",
+    )
+    p_clean.add_argument(
+        "--table",
+        default=d["table"],
+        help="Table name or stem (default: %(default)s)",
+    )
+    p_clean.add_argument(
+        "--tables",
+        type=int,
+        default=d["tables"],
+        help="Number of tables (default: %(default)s)",
+    )
+
+    return parser
 
 
 class LiveStats:
     """Thread-safe counters for periodic reporting (measurement phase only)."""
 
-    __slots__ = ("_lock", "ops", "errors", "interval_latencies")
+    __slots__ = (
+        "_lock",
+        "ops",
+        "errors",
+        "stmt_sel",
+        "stmt_ins",
+        "stmt_upd",
+        "stmt_del",
+        "reconnects",
+        "interval_latencies",
+    )
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.ops = 0
         self.errors = 0
+        self.stmt_sel = 0
+        self.stmt_ins = 0
+        self.stmt_upd = 0
+        self.stmt_del = 0
+        self.reconnects = 0
         self.interval_latencies: List[float] = []
 
-    def record_op(self, ms: float) -> None:
+    def record_reconnect(self) -> None:
         with self._lock:
-            self.ops += 1
-            if len(self.interval_latencies) < _MAX_INTERVAL_LAT_SAMPLES:
-                self.interval_latencies.append(ms)
+            self.reconnects += 1
 
     def record_error(self) -> None:
         with self._lock:
             self.errors += 1
 
-    def snapshot_interval(self) -> Tuple[int, int, List[float]]:
-        """Return cumulative ops/errors and latencies since last snapshot; clear latency buffer."""
+    def snapshot_interval(self) -> Tuple[int, int, int, int, int, int, int, List[float]]:
+        """Cumulative txn/err/stmt/reconn counts; latencies since last snapshot (buffer cleared)."""
         with self._lock:
-            o, e = self.ops, self.errors
             lats = self.interval_latencies
             self.interval_latencies = []
-            return o, e, lats
+            return (
+                self.ops,
+                self.errors,
+                self.stmt_sel,
+                self.stmt_ins,
+                self.stmt_upd,
+                self.stmt_del,
+                self.reconnects,
+                lats,
+            )
 
 
 @dataclass
@@ -320,16 +380,76 @@ class BenchConfig:
     table: str
     tables: int
     table_size: int
-    prepare: bool
     warmup_sec: float
     report_interval_sec: float
+    report_percentile: float
 
 
 @dataclass
 class WorkerResult:
     ops: int = 0
     errors: int = 0
+    stmt_sel: int = 0
+    stmt_ins: int = 0
+    stmt_upd: int = 0
+    stmt_del: int = 0
+    reconnects: int = 0
     latencies_ms: List[float] = field(default_factory=list)
+
+    def add_stmt(self, op: str) -> None:
+        if op == "select":
+            self.stmt_sel += 1
+        elif op == "insert":
+            self.stmt_ins += 1
+        elif op == "update":
+            self.stmt_upd += 1
+        else:
+            self.stmt_del += 1
+
+    def add_stmts(self, ops: Sequence[str]) -> None:
+        for op in ops:
+            if op == "select":
+                self.stmt_sel += 1
+            elif op == "insert":
+                self.stmt_ins += 1
+            elif op == "update":
+                self.stmt_upd += 1
+            else:
+                self.stmt_del += 1
+
+
+def _finalize_txn_success(
+    result: WorkerResult,
+    live: Optional[LiveStats],
+    ops: Sequence[str],
+    ms: float,
+) -> None:
+    """Update per-thread result and optional shared LiveStats in one pass (one lock when live)."""
+    result.ops += 1
+    result.latencies_ms.append(ms)
+    if live is None:
+        if len(ops) == 1:
+            result.add_stmt(ops[0])
+        else:
+            result.add_stmts(ops)
+        return
+    with live._lock:
+        for op in ops:
+            if op == "select":
+                result.stmt_sel += 1
+                live.stmt_sel += 1
+            elif op == "insert":
+                result.stmt_ins += 1
+                live.stmt_ins += 1
+            elif op == "update":
+                result.stmt_upd += 1
+                live.stmt_upd += 1
+            else:
+                result.stmt_del += 1
+                live.stmt_del += 1
+        live.ops += 1
+        if len(live.interval_latencies) < _MAX_INTERVAL_LAT_SAMPLES:
+            live.interval_latencies.append(ms)
 
 
 def parse_db_url(url: str) -> Tuple[str, dict]:
@@ -505,6 +625,17 @@ def prepare_benchmark(conn, scheme: str, table_names: List[str], table_size: int
         cur.close()
 
 
+def cleanup_benchmark(conn, scheme: str, table_names: List[str]) -> None:
+    """Drop benchmark tables (IF EXISTS)."""
+    cur = conn.cursor()
+    try:
+        for t in table_names:
+            cur.execute(f"DROP TABLE IF EXISTS {t}")
+        conn.commit()
+    finally:
+        cur.close()
+
+
 def _pick_crud_op(u: float, crud: Tuple[float, float, float, float]) -> str:
     s, ins, upd, dele = crud
     if u < s:
@@ -518,7 +649,7 @@ def _pick_crud_op(u: float, crud: Tuple[float, float, float, float]) -> str:
 
 def _execute_crud_op(
     cur,
-    scheme: str,
+    is_pg: bool,
     op: str,
     tbl: str,
     pk_hi: Dict[str, int],
@@ -547,7 +678,7 @@ def _execute_crud_op(
             cur.fetchone()
     elif op == "insert":
         payload = f"w{threading.get_ident()}-{time.time_ns()}"
-        if scheme in ("postgresql", "postgres"):
+        if is_pg:
             cur.execute(
                 f"INSERT INTO {tbl} (payload) VALUES (%s) RETURNING id",
                 (payload,),
@@ -628,6 +759,17 @@ def worker_loop(
     nt = len(table_names)
     txn_multi = txn_mode == "multi"
     is_pg = scheme in ("postgresql", "postgres")
+    connection_lost = False
+    cur = None
+
+    def _discard_cursor() -> None:
+        nonlocal cur
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+            cur = None
 
     try:
         while time.monotonic() < end_time:
@@ -637,6 +779,12 @@ def worker_loop(
                     connect_fail_streak = 0
                     if not is_pg and txn_multi:
                         conn.autocommit(False)
+                    if connection_lost:
+                        result.reconnects += 1
+                        if live is not None:
+                            live.record_reconnect()
+                    connection_lost = False
+                    _discard_cursor()
                 except Exception:
                     connect_fail_streak += 1
                     # Back off so many workers do not busy-spin while the server is down.
@@ -644,36 +792,40 @@ def worker_loop(
                     time.sleep(delay)
                     continue
 
-            t0 = time.perf_counter()
-            cur = None
-            try:
+            if cur is None:
                 cur = conn.cursor()
+
+            t0 = time.perf_counter()
+            try:
                 if txn_multi:
                     if not is_pg:
                         cur.execute("START TRANSACTION")
                     tbl = table_names[randint(0, nt - 1)]
                     ttop = pk_hi.get(tbl, 0)
                     txn_rid = randint(1, ttop) if ttop >= 1 else None
-                    for _ in range(txn_statements):
+                    stmt_ops: List[str] = [""] * txn_statements
+                    for i in range(txn_statements):
                         op = _pick_crud_op(rand(), txn_crud)
-                        _execute_crud_op(cur, scheme, op, tbl, pk_hi, randint, txn_rid)
+                        _execute_crud_op(cur, is_pg, op, tbl, pk_hi, randint, txn_rid)
+                        stmt_ops[i] = op
                     conn.commit()
+                    ms = (time.perf_counter() - t0) * 1000.0
+                    _finalize_txn_success(result, live, stmt_ops, ms)
                 else:
                     op = _pick_crud_op(rand(), crud)
                     tbl = table_names[randint(0, nt - 1)]
-                    _execute_crud_op(cur, scheme, op, tbl, pk_hi, randint, None)
+                    _execute_crud_op(cur, is_pg, op, tbl, pk_hi, randint, None)
                     if is_pg:
                         conn.commit()
-                ms = (time.perf_counter() - t0) * 1000.0
-                result.ops += 1
-                result.latencies_ms.append(ms)
-                if live is not None:
-                    live.record_op(ms)
+                    ms = (time.perf_counter() - t0) * 1000.0
+                    _finalize_txn_success(result, live, (op,), ms)
             except Exception as e:
+                _discard_cursor()
                 result.errors += 1
                 if live is not None:
                     live.record_error()
                 if _is_connection_level_error(e, scheme):
+                    connection_lost = True
                     _safe_close_conn(conn)
                     conn = None
                     time.sleep(0.05)
@@ -681,15 +833,11 @@ def worker_loop(
                     try:
                         conn.rollback()
                     except Exception:
+                        connection_lost = True
                         _safe_close_conn(conn)
                         conn = None
-            finally:
-                if cur is not None:
-                    try:
-                        cur.close()
-                    except Exception:
-                        pass
     finally:
+        _discard_cursor()
         _safe_close_conn(conn)
 
 
@@ -709,36 +857,76 @@ def merge_results(parts: List[WorkerResult]) -> WorkerResult:
     for p in parts:
         out.ops += p.ops
         out.errors += p.errors
-        out.latencies_ms.extend(p.latencies_ms)
+        out.stmt_sel += p.stmt_sel
+        out.stmt_ins += p.stmt_ins
+        out.stmt_upd += p.stmt_upd
+        out.stmt_del += p.stmt_del
+        out.reconnects += p.reconnects
+    out.latencies_ms = list(chain.from_iterable(p.latencies_ms for p in parts))
     return out
 
 
-def periodic_report_loop(live: LiveStats, interval_sec: float, stop: threading.Event) -> None:
-    last_ops = 0
-    last_errors = 0
-    last_t = time.perf_counter()
+def periodic_report_loop(
+    live: LiveStats,
+    interval_sec: float,
+    stop: threading.Event,
+    report_percentile: float,
+    report_t0: float,
+) -> None:
+    """sysbench-style lines (no thds): [ Ns ] tps: … qps: … (r/w/o: …) lat … err/s … reconn/s …"""
+    last_txn = 0
+    last_err = 0
+    last_rs = last_ri = last_ru = last_rd = last_reconn = 0
+    last_tick = time.perf_counter()
     while True:
         signaled = stop.wait(timeout=interval_sec)
         now = time.perf_counter()
-        wall = max(now - last_t, 1e-9)
-        cum_ops, cum_errs, lats = live.snapshot_interval()
-        d_o = cum_ops - last_ops
-        d_e = cum_errs - last_errors
-        last_ops, last_errors = cum_ops, cum_errs
-        last_t = now
-        parts = [
-            f"[interval {wall:.2f}s]",
-            f"ops={d_o}",
-            f"errors={d_e}",
-            f"qps={d_o / wall:.2f}",
-        ]
+        wall = max(now - last_tick, 1e-9)
+        elapsed = int(now - report_t0)
+        (
+            cum_txn,
+            cum_err,
+            cum_rs,
+            cum_ri,
+            cum_ru,
+            cum_rd,
+            cum_reconn,
+            lats,
+        ) = live.snapshot_interval()
+        d_txn = cum_txn - last_txn
+        d_err = cum_err - last_err
+        d_rs = cum_rs - last_rs
+        d_ri = cum_ri - last_ri
+        d_ru = cum_ru - last_ru
+        d_rd = cum_rd - last_rd
+        d_reconn = cum_reconn - last_reconn
+        last_txn, last_err = cum_txn, cum_err
+        last_rs, last_ri, last_ru, last_rd = cum_rs, cum_ri, cum_ru, cum_rd
+        last_reconn = cum_reconn
+        last_tick = now
+
+        tps = d_txn / wall
+        d_stmt = d_rs + d_ri + d_ru + d_rd
+        qps = d_stmt / wall
+        rps = d_rs / wall
+        wps = (d_ri + d_ru) / wall
+        ops_o = d_rd / wall
+        err_s = d_err / wall
+        reconn_s = d_reconn / wall
+
         if lats:
             sl = sorted(lats)
-            parts.append(f"latency_ms_mean={statistics.mean(sl):.3f}")
-            parts.append(f"p50={percentile(sl, 50):.3f}")
-            parts.append(f"p95={percentile(sl, 95):.3f}")
-            parts.append(f"p99={percentile(sl, 99):.3f}")
-        print(" ".join(parts), flush=True)
+            lat_p = percentile(sl, report_percentile)
+            lat_part = f"lat (ms,{report_percentile:.0f}%): {lat_p:.2f}"
+        else:
+            lat_part = f"lat (ms,{report_percentile:.0f}%): nan"
+
+        line = (
+            f"[ {elapsed}s ] tps: {tps:.2f} qps: {qps:.2f} "
+            f"(r/w/o: {rps:.2f}/{wps:.2f}/{ops_o:.2f}) "
+            f"{lat_part} err/s: {err_s:.2f} reconn/s: {reconn_s:.2f}"
+        )
+        print(line, flush=True)
         if signaled:
             break
 
@@ -756,13 +944,6 @@ def run_bench(cfg: BenchConfig) -> WorkerResult:
         cfg.txn_update_ratio,
         cfg.txn_delete_ratio,
     )
-
-    if cfg.prepare:
-        conn = connect_postgres(kwargs) if scheme == "postgresql" else connect_mysql(kwargs)
-        try:
-            prepare_benchmark(conn, scheme, table_names, cfg.table_size)
-        finally:
-            conn.close()
 
     results: List[WorkerResult] = [WorkerResult() for _ in range(cfg.workers)]
 
@@ -790,6 +971,8 @@ def run_bench(cfg: BenchConfig) -> WorkerResult:
         for r in results:
             r.ops = 0
             r.errors = 0
+            r.stmt_sel = r.stmt_ins = r.stmt_upd = r.stmt_del = 0
+            r.reconnects = 0
             r.latencies_ms.clear()
 
     end = time.monotonic() + cfg.duration_sec
@@ -799,9 +982,16 @@ def run_bench(cfg: BenchConfig) -> WorkerResult:
     if cfg.report_interval_sec > 0:
         live = LiveStats()
         stop_report = threading.Event()
+        report_t0 = time.perf_counter()
         rep_thread = threading.Thread(
             target=periodic_report_loop,
-            args=(live, cfg.report_interval_sec, stop_report),
+            args=(
+                live,
+                cfg.report_interval_sec,
+                stop_report,
+                cfg.report_percentile,
+                report_t0,
+            ),
             name="db-bench-report",
             daemon=True,
         )
@@ -843,27 +1033,65 @@ def print_report(total: WorkerResult, duration_sec: float, workload_line: str = 
     if workload_line:
         print(workload_line)
     print(f"duration_s: {duration_sec:.3f}")
-    print(f"operations: {total.ops}  errors: {total.errors}")
+    print(f"transactions: {total.ops}  errors: {total.errors}")
     if duration_sec > 0:
-        print(f"throughput_ops_s: {total.ops / duration_sec:.2f}")
+        print(f"throughput_tps: {total.ops / duration_sec:.2f}")
+        stmts = total.stmt_sel + total.stmt_ins + total.stmt_upd + total.stmt_del
+        qps = stmts / duration_sec
+        rps = total.stmt_sel / duration_sec
+        wps = (total.stmt_ins + total.stmt_upd) / duration_sec
+        ops_o = total.stmt_del / duration_sec
+        err_s = total.errors / duration_sec
+        reconn_s = total.reconnects / duration_sec
+        print(
+            f"qps: {qps:.2f} (r/w/o: {rps:.2f}/{wps:.2f}/{ops_o:.2f}) "
+            f"err/s: {err_s:.2f} reconn/s: {reconn_s:.2f}"
+        )
     if n:
         print(f"latency_ms: min={lat[0]:.3f}  max={lat[-1]:.3f}  mean={statistics.mean(lat):.3f}")
         for p in (50, 95, 99):
             print(f"latency_ms_p{p}: {percentile(lat, p):.3f}")
 
 
-def main() -> None:
-    cfg_path, argv_rest = extract_config_path(sys.argv[1:])
-    file_cfg: dict = {}
-    if cfg_path:
-        file_cfg = normalize_config_mapping(load_config_file(cfg_path))
-    merged = merge_config_with_program_defaults(file_cfg)
-    p = build_argument_parser(merged)
-    args = p.parse_args(argv_rest)
-    if args.no_prepare:
-        args.prepare = False
-    if not args.url or not str(args.url).strip():
+def _require_db_url(url: object) -> str:
+    if not url or not str(url).strip():
         raise SystemExit("Database URL is required (config key 'url' or --url).")
+    return str(url).strip()
+
+
+def cmd_prepare(args: argparse.Namespace) -> None:
+    if args.tables < 1:
+        raise SystemExit("--tables must be >= 1")
+    if args.table_size < 0:
+        raise SystemExit("--table-size must be >= 0")
+    url = _require_db_url(args.url)
+    scheme, kwargs = parse_db_url(url)
+    if scheme == "postgres":
+        scheme = "postgresql"
+    table_names = physical_table_names(args.table, args.tables)
+    conn = connect_postgres(kwargs) if scheme == "postgresql" else connect_mysql(kwargs)
+    try:
+        prepare_benchmark(conn, scheme, table_names, args.table_size)
+    finally:
+        conn.close()
+
+
+def cmd_cleanup(args: argparse.Namespace) -> None:
+    if args.tables < 1:
+        raise SystemExit("--tables must be >= 1")
+    url = _require_db_url(args.url)
+    scheme, kwargs = parse_db_url(url)
+    if scheme == "postgres":
+        scheme = "postgresql"
+    table_names = physical_table_names(args.table, args.tables)
+    conn = connect_postgres(kwargs) if scheme == "postgresql" else connect_mysql(kwargs)
+    try:
+        cleanup_benchmark(conn, scheme, table_names)
+    finally:
+        conn.close()
+
+
+def cmd_run(args: argparse.Namespace) -> None:
     if args.report_interval < 0:
         raise SystemExit("--report-interval must be >= 0")
     if args.report_interval > 0 and args.report_interval < 0.1:
@@ -874,6 +1102,8 @@ def main() -> None:
         raise SystemExit("--table-size must be >= 0")
     if args.txn_mode == "multi" and args.txn_statements < 1:
         raise SystemExit("--txn-statements must be >= 1 when --txn-mode multi")
+    if not 0 < args.report_percentile <= 100:
+        raise SystemExit("--report-percentile must be in (0, 100]")
 
     if args.mode == "read":
         s, ins, upd, dele = 1.0, 0.0, 0.0, 0.0
@@ -902,7 +1132,7 @@ def main() -> None:
     ts, tins, tupd, tdel = normalize_crud_ratios(ts, tins, tupd, tdel)
 
     cfg = BenchConfig(
-        url=args.url,
+        url=_require_db_url(args.url),
         workers=max(1, args.workers),
         duration_sec=max(0.01, args.duration),
         select_ratio=s,
@@ -918,15 +1148,12 @@ def main() -> None:
         table=args.table,
         tables=args.tables,
         table_size=args.table_size,
-        prepare=args.prepare,
         warmup_sec=max(0.0, args.warmup),
         report_interval_sec=args.report_interval,
+        report_percentile=args.report_percentile,
     )
 
-    t0 = time.perf_counter()
     total = run_bench(cfg)
-    elapsed = time.perf_counter() - t0
-    # Use configured duration for throughput (steady window); fallback to wall clock
     measure_sec = cfg.duration_sec if cfg.warmup_sec == 0 else cfg.duration_sec
     if args.mode == "oltp":
         wl = (
@@ -948,8 +1175,23 @@ def main() -> None:
         f"(stem={cfg.table!r})"
     )
     if cfg.txn_mode == "multi":
-        wl += " | note: operations/throughput = completed transactions (not single SQLs)"
+        wl += " | note: each transaction contains multiple SQLs; TPS counts commits"
     print_report(total, measure_sec, wl)
+
+
+def main() -> None:
+    cfg_path, argv_rest = extract_config_path(sys.argv[1:])
+    file_cfg: dict = {}
+    if cfg_path:
+        file_cfg = normalize_config_mapping(load_config_file(cfg_path))
+    merged = merge_config_with_program_defaults(file_cfg)
+    args = build_argument_parser(merged).parse_args(argv_rest)
+    if args.command == "prepare":
+        cmd_prepare(args)
+    elif args.command == "cleanup":
+        cmd_cleanup(args)
+    else:
+        cmd_run(args)
 
 
 if __name__ == "__main__":
