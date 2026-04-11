@@ -117,6 +117,11 @@ python3 db_bench.py -c mybench.yaml cleanup
 
 文件中不认识的键会 **警告并忽略**（便于发现拼写错误）。
 
+### Model YAML（可选）
+
+- 使用 **`prepare --model`** / **`run --model`** 指向 YAML，可定义额外列、索引，以及 **`run.update_columns`**（压测 UPDATE 要改哪些列）。详见 **`models/example.yaml`** 与 **`models/README.md`**。
+- 主配置里可设置 **`model: "models/example.yaml"`**（与 CLI 一致）。
+
 ## 压测在做什么
 
 每个并发线程在持续时间内循环执行；**先在多张物理表上均匀随机选一张表**，再按 **增删改查** 权重随机一种操作：
@@ -124,7 +129,7 @@ python3 db_bench.py -c mybench.yaml cleanup
 - **查 SELECT（表内已有主键上界时）**：`SELECT … FROM <表> WHERE id = ?`，`id` 在 `1..上界` 内均匀随机（类似 sysbench 点查主键）。上界来自 **`prepare` 预置行数**（`--table-size`），以及**本线程**成功插入后观测到的最大 `id`。
 - **查（表仍空、上界为 0）**：`SELECT … ORDER BY id DESC LIMIT 1`。
 - **增 INSERT**：插入一行新 `payload`；PostgreSQL 用 `RETURNING id`、MySQL 用 `lastrowid` 更新本线程上界。
-- **改 UPDATE**：`UPDATE … SET payload = ? WHERE id = ?`（`id` 的选取方式与点查相同；表空时用 `WHERE id = (SELECT MAX(id) FROM 表)`，可能更新 0 行）。
+- **改 UPDATE**：按 `--model` 中 `run.update_columns` 更新列（未指定 model 时仅更新 `payload`）；`id` 的选取方式与点查相同；表空时用 `WHERE id = (SELECT MAX(id) FROM 表)`，可能更新 0 行。
 - **删 DELETE**：`DELETE … WHERE id = ?`（同上；表空时用 `WHERE id = (SELECT MAX(id) FROM 表)`）。
 
 **比例参数**（仅 **`--mode oltp`** 使用）：`--select-ratio`、`--insert-ratio`、`--update-ratio`、`--delete-ratio` 为**权重**，程序会按四者之和归一化后，作为每次循环选操作类型的概率（例如 `2 2 0 0` 与 `0.5 0.5 0 0` 等价）。默认与旧版「读写各半」一致：`0.5 / 0.5 / 0 / 0`。
@@ -163,7 +168,7 @@ PostgreSQL 预置数据使用单条 `INSERT … SELECT … generate_series`；My
 
 ## 参数说明（必选、默认值、配置键）
 
-CLI 形式为 **`python3 db_bench.py <子命令> [选项]`**，子命令为 **`prepare`** | **`run`** | **`cleanup`**。下列「CLI」列对应 **`run`** 下的选项（`prepare` / `cleanup` 仅有 `--url`、`--table`、`--tables`，且 `cleanup` 无 `--table-size`）。
+CLI 形式为 **`python3 db_bench.py <子命令> [选项]`**，子命令为 **`prepare`** | **`run`** | **`cleanup`**。下列「CLI」列对应 **`run`** 下的选项（`prepare` / `cleanup` 仅有 `--url`、`--table`、`--tables`，且 `cleanup` 无 `--table-size`；二者另有 **`--model`** 时见 `prepare`/`run` 帮助）。
 
 **必选（二选一即可）**
 
@@ -194,6 +199,7 @@ CLI 形式为 **`python3 db_bench.py <子命令> [选项]`**，子命令为 **`p
 | `warmup` | `--warmup` | `0` | 预热秒数（**仅 `run`**） |
 | `report_interval` | `--report-interval` | `0` | 周期打印间隔秒数；`0` 关闭 |
 | `report_percentile` | `--report-percentile` | `95` | 周期行里 `lat (ms,P%)` 的分位 P（与 sysbench 默认 95 对齐） |
+| `model` | `--model` | （无） | Model YAML 路径；`prepare` 与 `run` 共用（见 `models/example.yaml`） |
 
 约束与提示：
 

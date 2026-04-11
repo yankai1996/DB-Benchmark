@@ -13,26 +13,27 @@ import sys
 import statistics
 import threading
 import time
-import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from itertools import chain
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
+
+from bench_model import (
+    BenchModel,
+    ExtraColumn,
+    default_bench_model,
+    load_bench_model,
+)
+
+from db_backends import Backend, get_backend, parse_db_url, workload_select_columns
 
 # --- drivers (import lazily after URL check) ---
 
 # Cap latency samples per reporting window to bound memory under very high QPS.
 _MAX_INTERVAL_LAT_SAMPLES = 100_000
 
-# Avoid hanging forever when the server is down; reconnect uses the same timeouts.
-_CONNECT_TIMEOUT_SEC = 10
-_MYSQL_SOCK_TIMEOUT_SEC = 30
-
 # SQL identifiers: table stem and generated names (no quoting).
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MAX_IDENT_LEN = 60
-
-_MYSQL_FILL_CHUNK = 1000
 
 # Defaults for CLI and config file (YAML). Keys use snake_case; YAML may use hyphens (normalized).
 _PROGRAM_DEFAULTS: Dict[str, object] = {
@@ -56,6 +57,7 @@ _PROGRAM_DEFAULTS: Dict[str, object] = {
     "warmup": 0.0,
     "report_interval": 0.0,
     "report_percentile": 95.0,
+    "model": None,
 }
 
 _CONFIG_ALLOWED_KEYS = frozenset(_PROGRAM_DEFAULTS.keys())
@@ -171,6 +173,13 @@ def build_argument_parser(defaults: Dict[str, object]) -> argparse.ArgumentParse
         p_prep,
         table_size_help="If >0, insert this many rows per table when the table is empty "
         "(default: %(default)s)",
+    )
+    p_prep.add_argument(
+        "--model",
+        default=d["model"],
+        metavar="FILE.yaml",
+        help="YAML model: prepare.extra_columns, prepare.indexes, and optional run.* "
+        "(see models/example.yaml); omit for built-in schema",
     )
 
     p_run = sub.add_parser(
@@ -290,6 +299,13 @@ def build_argument_parser(defaults: Dict[str, object]) -> argparse.ArgumentParse
         metavar="P",
         help="Latency percentile in periodic lines (sysbench-style; default: %(default)s)",
     )
+    p_run.add_argument(
+        "--model",
+        default=d["model"],
+        metavar="FILE.yaml",
+        help="YAML model: run.update_columns lists columns SET by UPDATE (see models/example.yaml); "
+        "omit for payload-only updates",
+    )
 
     p_clean = sub.add_parser(
         "cleanup",
@@ -337,9 +353,26 @@ class LiveStats:
         self.reconnects = 0
         self.interval_latencies: List[float] = []
 
+    def record_stmt(self, op: str) -> None:
+        with self._lock:
+            if op == "select":
+                self.stmt_sel += 1
+            elif op == "insert":
+                self.stmt_ins += 1
+            elif op == "update":
+                self.stmt_upd += 1
+            else:
+                self.stmt_del += 1
+
     def record_reconnect(self) -> None:
         with self._lock:
             self.reconnects += 1
+
+    def record_op(self, ms: float) -> None:
+        with self._lock:
+            self.ops += 1
+            if len(self.interval_latencies) < _MAX_INTERVAL_LAT_SAMPLES:
+                self.interval_latencies.append(ms)
 
     def record_error(self) -> None:
         with self._lock:
@@ -383,6 +416,8 @@ class BenchConfig:
     warmup_sec: float
     report_interval_sec: float
     report_percentile: float
+    update_columns: Tuple[str, ...]
+    extra_columns: Tuple[ExtraColumn, ...]
 
 
 @dataclass
@@ -406,110 +441,6 @@ class WorkerResult:
         else:
             self.stmt_del += 1
 
-    def add_stmts(self, ops: Sequence[str]) -> None:
-        for op in ops:
-            if op == "select":
-                self.stmt_sel += 1
-            elif op == "insert":
-                self.stmt_ins += 1
-            elif op == "update":
-                self.stmt_upd += 1
-            else:
-                self.stmt_del += 1
-
-
-def _finalize_txn_success(
-    result: WorkerResult,
-    live: Optional[LiveStats],
-    ops: Sequence[str],
-    ms: float,
-) -> None:
-    """Update per-thread result and optional shared LiveStats in one pass (one lock when live)."""
-    result.ops += 1
-    result.latencies_ms.append(ms)
-    if live is None:
-        if len(ops) == 1:
-            result.add_stmt(ops[0])
-        else:
-            result.add_stmts(ops)
-        return
-    with live._lock:
-        for op in ops:
-            if op == "select":
-                result.stmt_sel += 1
-                live.stmt_sel += 1
-            elif op == "insert":
-                result.stmt_ins += 1
-                live.stmt_ins += 1
-            elif op == "update":
-                result.stmt_upd += 1
-                live.stmt_upd += 1
-            else:
-                result.stmt_del += 1
-                live.stmt_del += 1
-        live.ops += 1
-        if len(live.interval_latencies) < _MAX_INTERVAL_LAT_SAMPLES:
-            live.interval_latencies.append(ms)
-
-
-def parse_db_url(url: str) -> Tuple[str, dict]:
-    """Return (scheme, connection kwargs)."""
-    parsed = urllib.parse.urlparse(url)
-    scheme = (parsed.scheme or "").lower().replace("+asyncpg", "").replace("+psycopg2", "")
-    if scheme not in ("postgresql", "postgres", "mysql"):
-        raise SystemExit(
-            f"Unsupported URL scheme {parsed.scheme!r}. Use postgresql:// or mysql://"
-        )
-    user = urllib.parse.unquote(parsed.username or "")
-    password = urllib.parse.unquote(parsed.password or "") if parsed.password else ""
-    host = parsed.hostname or "localhost"
-    port = parsed.port
-    db = (parsed.path or "/").lstrip("/") or "postgres"
-    return scheme, {
-        "user": user,
-        "password": password,
-        "host": host,
-        "port": port,
-        "database": db,
-    }
-
-
-def connect_postgres(kwargs: dict):
-    import psycopg2
-
-    port = kwargs["port"] or 5432
-    return psycopg2.connect(
-        host=kwargs["host"],
-        port=port,
-        user=kwargs["user"],
-        password=kwargs["password"],
-        dbname=kwargs["database"],
-        connect_timeout=_CONNECT_TIMEOUT_SEC,
-    )
-
-
-def connect_mysql(kwargs: dict):
-    import pymysql
-
-    port = kwargs["port"] or 3306
-    return pymysql.connect(
-        host=kwargs["host"],
-        port=port,
-        user=kwargs["user"],
-        password=kwargs["password"],
-        database=kwargs["database"],
-        autocommit=True,
-        connect_timeout=_CONNECT_TIMEOUT_SEC,
-        read_timeout=_MYSQL_SOCK_TIMEOUT_SEC,
-        write_timeout=_MYSQL_SOCK_TIMEOUT_SEC,
-    )
-
-
-def _open_connection(scheme: str, kwargs: dict):
-    if scheme in ("postgresql", "postgres"):
-        return connect_postgres(kwargs)
-    return connect_mysql(kwargs)
-
 
 def _safe_close_conn(conn) -> None:
     if conn is None:
@@ -520,17 +451,11 @@ def _safe_close_conn(conn) -> None:
         pass
 
 
-def _is_connection_level_error(exc: BaseException, scheme: str) -> bool:
+def _should_reconnect(exc: BaseException, backend: Backend) -> bool:
     """True if the client session is likely unusable (restart, failover, network drop)."""
     if isinstance(exc, (TimeoutError, ConnectionError, BrokenPipeError)):
         return True
-    if scheme in ("postgresql", "postgres"):
-        import psycopg2
-
-        return isinstance(exc, (psycopg2.OperationalError, psycopg2.InterfaceError))
-    import pymysql.err
-
-    return isinstance(exc, (pymysql.err.OperationalError, pymysql.err.InterfaceError))
+    return backend.is_connection_error(exc)
 
 
 def _check_identifier(name: str, what: str) -> None:
@@ -564,51 +489,24 @@ def physical_table_names(stem: str, num_tables: int) -> List[str]:
     return names
 
 
-def ddl_for_table(scheme: str, table: str) -> str:
-    if scheme in ("postgresql", "postgres"):
-        return f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            id BIGSERIAL PRIMARY KEY,
-            payload TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        CREATE INDEX IF NOT EXISTS idx_{table}_created ON {table} (created_at DESC);
-        """
-    return f"""
-    CREATE TABLE IF NOT EXISTS {table} (
-        id BIGINT AUTO_INCREMENT PRIMARY KEY,
-        payload TEXT NOT NULL,
-        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-        INDEX idx_{table}_created (created_at)
-    );
-    """
-
-
-def _fill_table_postgres(cur, table: str, n: int) -> None:
-    cur.execute(
-        f"INSERT INTO {table} (payload) SELECT md5(random()::text) "
-        f"FROM generate_series(1, %s)",
-        (n,),
-    )
-
-
-def _fill_table_mysql(cur, table: str, n: int) -> None:
-    off = 0
-    while off < n:
-        m = min(_MYSQL_FILL_CHUNK, n - off)
-        rows = [(f"b{off + i}",) for i in range(m)]
-        cur.executemany(f"INSERT INTO {table} (payload) VALUES (%s)", rows)
-        off += m
-
-
-def prepare_benchmark(conn, scheme: str, table_names: List[str], table_size: int) -> None:
+def prepare_benchmark(
+    conn,
+    backend: Backend,
+    table_names: List[str],
+    table_size: int,
+    model: Optional[BenchModel] = None,
+) -> None:
     cur = conn.cursor()
     try:
         for t in table_names:
-            for stmt in ddl_for_table(scheme, t).split(";"):
-                s = stmt.strip()
-                if s:
-                    cur.execute(s)
+            if model is None:
+                for stmt in backend.default_ddl(t).split(";"):
+                    s = stmt.strip()
+                    if s:
+                        cur.execute(s)
+            else:
+                for stmt in backend.prepare_model_statements(t, model):
+                    cur.execute(stmt)
             conn.commit()
             if table_size <= 0:
                 continue
@@ -616,16 +514,13 @@ def prepare_benchmark(conn, scheme: str, table_names: List[str], table_size: int
             cnt = cur.fetchone()[0]
             if cnt > 0:
                 continue
-            if scheme in ("postgresql", "postgres"):
-                _fill_table_postgres(cur, t, table_size)
-            else:
-                _fill_table_mysql(cur, t, table_size)
+            backend.fill_table(cur, t, table_size)
             conn.commit()
     finally:
         cur.close()
 
 
-def cleanup_benchmark(conn, scheme: str, table_names: List[str]) -> None:
+def cleanup_benchmark(conn, table_names: List[str]) -> None:
     """Drop benchmark tables (IF EXISTS)."""
     cur = conn.cursor()
     try:
@@ -647,87 +542,8 @@ def _pick_crud_op(u: float, crud: Tuple[float, float, float, float]) -> str:
     return "delete"
 
 
-def _execute_crud_op(
-    cur,
-    is_pg: bool,
-    op: str,
-    tbl: str,
-    pk_hi: Dict[str, int],
-    randint,
-    fixed_rid: Optional[int],
-) -> None:
-    """Run one statement. If fixed_rid is set, SELECT/UPDATE/DELETE use that id (multi-stmt txn)."""
-    top = pk_hi.get(tbl, 0)
-
-    if op == "select":
-        if fixed_rid is not None:
-            cur.execute(
-                f"SELECT id, payload FROM {tbl} WHERE id = %s",
-                (fixed_rid,),
-            )
-            cur.fetchone()
-        elif top < 1:
-            cur.execute(f"SELECT id, payload FROM {tbl} ORDER BY id DESC LIMIT 1")
-            cur.fetchone()
-        else:
-            rid = randint(1, top)
-            cur.execute(
-                f"SELECT id, payload FROM {tbl} WHERE id = %s",
-                (rid,),
-            )
-            cur.fetchone()
-    elif op == "insert":
-        payload = f"w{threading.get_ident()}-{time.time_ns()}"
-        if is_pg:
-            cur.execute(
-                f"INSERT INTO {tbl} (payload) VALUES (%s) RETURNING id",
-                (payload,),
-            )
-            row = cur.fetchone()
-            if row:
-                new_id = int(row[0])
-                if new_id > pk_hi[tbl]:
-                    pk_hi[tbl] = new_id
-        else:
-            cur.execute(
-                f"INSERT INTO {tbl} (payload) VALUES (%s)",
-                (payload,),
-            )
-            lid = cur.lastrowid
-            if lid and lid > pk_hi[tbl]:
-                pk_hi[tbl] = int(lid)
-    elif op == "update":
-        pl = f"u{threading.get_ident()}-{time.time_ns()}"
-        if fixed_rid is not None:
-            cur.execute(
-                f"UPDATE {tbl} SET payload = %s WHERE id = %s",
-                (pl, fixed_rid),
-            )
-        elif top < 1:
-            cur.execute(
-                f"UPDATE {tbl} SET payload = %s WHERE id = (SELECT MAX(id) FROM {tbl})",
-                (pl,),
-            )
-        else:
-            rid = randint(1, top)
-            cur.execute(
-                f"UPDATE {tbl} SET payload = %s WHERE id = %s",
-                (pl, rid),
-            )
-    else:
-        if fixed_rid is not None:
-            cur.execute(f"DELETE FROM {tbl} WHERE id = %s", (fixed_rid,))
-        elif top < 1:
-            cur.execute(
-                f"DELETE FROM {tbl} WHERE id = (SELECT MAX(id) FROM {tbl})",
-            )
-        else:
-            rid = randint(1, top)
-            cur.execute(f"DELETE FROM {tbl} WHERE id = %s", (rid,))
-
-
 def worker_loop(
-    scheme: str,
+    backend: Backend,
     kwargs: dict,
     table_names: List[str],
     initial_row_count: int,
@@ -738,6 +554,8 @@ def worker_loop(
     end_time: float,
     result: WorkerResult,
     live: Optional[LiveStats] = None,
+    update_columns: Tuple[str, ...] = ("payload",),
+    extra_columns: Tuple[ExtraColumn, ...] = (),
 ) -> None:
     conn = None
     connect_fail_streak = 0
@@ -756,35 +574,24 @@ def worker_loop(
         return _rng().randint(a, b)
 
     pk_hi = {t: initial_row_count for t in table_names}
+    extra_by_name = {e.name: e for e in extra_columns}
+    select_list_sql = workload_select_columns(update_columns)
     nt = len(table_names)
     txn_multi = txn_mode == "multi"
-    is_pg = scheme in ("postgresql", "postgres")
     connection_lost = False
-    cur = None
-
-    def _discard_cursor() -> None:
-        nonlocal cur
-        if cur is not None:
-            try:
-                cur.close()
-            except Exception:
-                pass
-            cur = None
 
     try:
         while time.monotonic() < end_time:
             if conn is None:
                 try:
-                    conn = _open_connection(scheme, kwargs)
+                    conn = backend.connect(kwargs)
                     connect_fail_streak = 0
-                    if not is_pg and txn_multi:
-                        conn.autocommit(False)
+                    backend.on_worker_connect(conn, txn_multi)
                     if connection_lost:
                         result.reconnects += 1
                         if live is not None:
                             live.record_reconnect()
                     connection_lost = False
-                    _discard_cursor()
                 except Exception:
                     connect_fail_streak += 1
                     # Back off so many workers do not busy-spin while the server is down.
@@ -792,39 +599,67 @@ def worker_loop(
                     time.sleep(delay)
                     continue
 
-            if cur is None:
-                cur = conn.cursor()
-
             t0 = time.perf_counter()
+            cur = None
             try:
+                cur = conn.cursor()
                 if txn_multi:
-                    if not is_pg:
-                        cur.execute("START TRANSACTION")
+                    backend.begin_multi_statement_transaction(cur)
                     tbl = table_names[randint(0, nt - 1)]
                     ttop = pk_hi.get(tbl, 0)
                     txn_rid = randint(1, ttop) if ttop >= 1 else None
-                    stmt_ops: List[str] = [""] * txn_statements
-                    for i in range(txn_statements):
+                    stmt_ops: List[str] = []
+                    for _ in range(txn_statements):
                         op = _pick_crud_op(rand(), txn_crud)
-                        _execute_crud_op(cur, is_pg, op, tbl, pk_hi, randint, txn_rid)
-                        stmt_ops[i] = op
+                        backend.execute_workload_statement(
+                            cur,
+                            op,
+                            tbl,
+                            pk_hi,
+                            randint,
+                            txn_rid,
+                            update_columns,
+                            extra_by_name,
+                            select_list_sql,
+                        )
+                        stmt_ops.append(op)
                     conn.commit()
-                    ms = (time.perf_counter() - t0) * 1000.0
-                    _finalize_txn_success(result, live, stmt_ops, ms)
                 else:
                     op = _pick_crud_op(rand(), crud)
                     tbl = table_names[randint(0, nt - 1)]
-                    _execute_crud_op(cur, is_pg, op, tbl, pk_hi, randint, None)
-                    if is_pg:
+                    backend.execute_workload_statement(
+                        cur,
+                        op,
+                        tbl,
+                        pk_hi,
+                        randint,
+                        None,
+                        update_columns,
+                        extra_by_name,
+                        select_list_sql,
+                    )
+                    if backend.commit_after_each_statement_single_mode():
                         conn.commit()
-                    ms = (time.perf_counter() - t0) * 1000.0
-                    _finalize_txn_success(result, live, (op,), ms)
+                ms = (time.perf_counter() - t0) * 1000.0
+                result.ops += 1
+                result.latencies_ms.append(ms)
+                if txn_multi:
+                    for o in stmt_ops:
+                        result.add_stmt(o)
+                else:
+                    result.add_stmt(op)
+                if live is not None:
+                    if txn_multi:
+                        for o in stmt_ops:
+                            live.record_stmt(o)
+                    else:
+                        live.record_stmt(op)
+                    live.record_op(ms)
             except Exception as e:
-                _discard_cursor()
                 result.errors += 1
                 if live is not None:
                     live.record_error()
-                if _is_connection_level_error(e, scheme):
+                if _should_reconnect(e, backend):
                     connection_lost = True
                     _safe_close_conn(conn)
                     conn = None
@@ -836,8 +671,13 @@ def worker_loop(
                         connection_lost = True
                         _safe_close_conn(conn)
                         conn = None
+            finally:
+                if cur is not None:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
     finally:
-        _discard_cursor()
         _safe_close_conn(conn)
 
 
@@ -862,7 +702,7 @@ def merge_results(parts: List[WorkerResult]) -> WorkerResult:
         out.stmt_upd += p.stmt_upd
         out.stmt_del += p.stmt_del
         out.reconnects += p.reconnects
-    out.latencies_ms = list(chain.from_iterable(p.latencies_ms for p in parts))
+        out.latencies_ms.extend(p.latencies_ms)
     return out
 
 
@@ -933,8 +773,7 @@ def periodic_report_loop(
 
 def run_bench(cfg: BenchConfig) -> WorkerResult:
     scheme, kwargs = parse_db_url(cfg.url)
-    if scheme == "postgres":
-        scheme = "postgresql"
+    backend = get_backend(scheme)
 
     table_names = physical_table_names(cfg.table, cfg.tables)
     crud = (cfg.select_ratio, cfg.insert_ratio, cfg.update_ratio, cfg.delete_ratio)
@@ -953,7 +792,7 @@ def run_bench(cfg: BenchConfig) -> WorkerResult:
             futs = [
                 ex.submit(
                     worker_loop,
-                    scheme,
+                    backend,
                     kwargs,
                     table_names,
                     cfg.table_size,
@@ -963,6 +802,9 @@ def run_bench(cfg: BenchConfig) -> WorkerResult:
                     txn_crud,
                     warm_end,
                     results[i],
+                    None,
+                    cfg.update_columns,
+                    cfg.extra_columns,
                 )
                 for i in range(cfg.workers)
             ]
@@ -1002,7 +844,7 @@ def run_bench(cfg: BenchConfig) -> WorkerResult:
             futs = [
                 ex.submit(
                     worker_loop,
-                    scheme,
+                    backend,
                     kwargs,
                     table_names,
                     cfg.table_size,
@@ -1013,6 +855,8 @@ def run_bench(cfg: BenchConfig) -> WorkerResult:
                     end,
                     results[i],
                     live,
+                    cfg.update_columns,
+                    cfg.extra_columns,
                 )
                 for i in range(cfg.workers)
             ]
@@ -1066,12 +910,14 @@ def cmd_prepare(args: argparse.Namespace) -> None:
         raise SystemExit("--table-size must be >= 0")
     url = _require_db_url(args.url)
     scheme, kwargs = parse_db_url(url)
-    if scheme == "postgres":
-        scheme = "postgresql"
+    backend = get_backend(scheme)
     table_names = physical_table_names(args.table, args.tables)
-    conn = connect_postgres(kwargs) if scheme == "postgresql" else connect_mysql(kwargs)
+    conn = backend.connect(kwargs)
     try:
-        prepare_benchmark(conn, scheme, table_names, args.table_size)
+        model: Optional[BenchModel] = None
+        if args.model:
+            model = load_bench_model(str(args.model))
+        prepare_benchmark(conn, backend, table_names, args.table_size, model=model)
     finally:
         conn.close()
 
@@ -1081,12 +927,11 @@ def cmd_cleanup(args: argparse.Namespace) -> None:
         raise SystemExit("--tables must be >= 1")
     url = _require_db_url(args.url)
     scheme, kwargs = parse_db_url(url)
-    if scheme == "postgres":
-        scheme = "postgresql"
+    backend = get_backend(scheme)
     table_names = physical_table_names(args.table, args.tables)
-    conn = connect_postgres(kwargs) if scheme == "postgresql" else connect_mysql(kwargs)
+    conn = backend.connect(kwargs)
     try:
-        cleanup_benchmark(conn, scheme, table_names)
+        cleanup_benchmark(conn, table_names)
     finally:
         conn.close()
 
@@ -1131,6 +976,11 @@ def cmd_run(args: argparse.Namespace) -> None:
         )
     ts, tins, tupd, tdel = normalize_crud_ratios(ts, tins, tupd, tdel)
 
+    if args.model:
+        bench_model = load_bench_model(str(args.model))
+    else:
+        bench_model = default_bench_model()
+
     cfg = BenchConfig(
         url=_require_db_url(args.url),
         workers=max(1, args.workers),
@@ -1151,6 +1001,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         warmup_sec=max(0.0, args.warmup),
         report_interval_sec=args.report_interval,
         report_percentile=args.report_percentile,
+        update_columns=bench_model.run_update_columns,
+        extra_columns=bench_model.extra_columns,
     )
 
     total = run_bench(cfg)
@@ -1174,6 +1026,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         f" | tables={cfg.tables} table_size={cfg.table_size} "
         f"(stem={cfg.table!r})"
     )
+    if args.model:
+        wl += f" | model={args.model!r} update_cols={list(cfg.update_columns)}"
     if cfg.txn_mode == "multi":
         wl += " | note: each transaction contains multiple SQLs; TPS counts commits"
     print_report(total, measure_sec, wl)

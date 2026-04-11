@@ -29,6 +29,9 @@ txn_delete_ratio: 1.0
 table: sbtest
 tables: 8
 table_size: 10000
+
+# Optional: YAML model for `prepare` and `run` (schema, indexes, run.update_columns). See models/example.yaml.
+# model: "models/example.yaml"
 warmup: 0.0
 report_interval: 5.0
 report_percentile: 95.0
