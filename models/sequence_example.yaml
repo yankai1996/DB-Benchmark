@@ -1,0 +1,27 @@
+# Fixed-order multi-statement workload: each transaction runs the steps below in order.
+# No mix weights and no weighted template picks — only bound values vary.
+# Requires workload.transaction.shape: multi. Optional workload.transaction.statement_count
+# must equal len(sequence) if set; otherwise it defaults to the number of steps.
+#
+#   python3 db_bench.py run --model models/sequence_example.yaml ...
+
+prepare:
+  indexes:
+    - name: k
+      columns: [k]
+
+run:
+  update_columns:
+    - k
+    - c
+
+workload:
+  transaction:
+    shape: multi
+  sequence:
+    - id: read_one
+      kind: select
+    - id: touch_row
+      kind: update
+    - id: add_row
+      kind: insert

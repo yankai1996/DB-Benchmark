@@ -7,54 +7,43 @@
 # PostgreSQL (conceptual):
 #   CREATE TABLE IF NOT EXISTS <stem|stemN> (
 #     id BIGSERIAL PRIMARY KEY,
-#     payload TEXT NOT NULL,
-#     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+#     k BIGINT NOT NULL DEFAULT 0,
+#     c CHAR(120) NOT NULL DEFAULT '',
+#     pad CHAR(60) NOT NULL DEFAULT ''
 #   );
-#   CREATE INDEX IF NOT EXISTS <table>_created ON <table> (created_at);
+#   CREATE INDEX IF NOT EXISTS <table>_k ON <table> (k);
 #
 # MySQL (conceptual):
 #   CREATE TABLE IF NOT EXISTS <stem|stemN> (
 #     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-#     payload TEXT NOT NULL,
-#     created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+#     k BIGINT NOT NULL DEFAULT 0,
+#     c CHAR(120) NOT NULL DEFAULT '',
+#     pad CHAR(60) NOT NULL DEFAULT '',
+#     INDEX idx_<table>_k (k)
 #   );
-#   CREATE INDEX IF NOT EXISTS ... ON <table> (created_at);
-#
-# Index logical name `created` becomes a physical name prefixed with the table name on PostgreSQL.
 
 prepare:
   indexes:
-    - name: created
-      columns: [created_at]
+    - name: k
+      columns: [k]
 
 run:
   update_columns:
-    - payload
+    - k
+    - c
 
 # --- Workload SQL (mix track; not written in YAML — generated at run time) ---
-# This file uses `workload.mix` (no `workload.statements`). Each loop picks one table,
-# then one of select / insert / update / delete by the weights under `mix.single`.
-# Statements are built in code (`db_backends`); placeholders use DB-API `%s`.
+# `select_list` = `id` plus columns from `run.update_columns` above (here: `id, k, c`).
 #
-# `select_list` = `id` plus columns from `run.update_columns` above (here: `id, payload`).
-#
-# SELECT (when the table has a positive row upper bound for this thread):
+# SELECT:
 #   SELECT <select_list> FROM <table> WHERE id = %s
-#   -- id uniform in 1..upper_bound; if empty table: SELECT ... ORDER BY id DESC LIMIT 1
 #
 # INSERT:
-#   PostgreSQL: INSERT INTO <table> (payload) VALUES (%s) RETURNING id
-#   MySQL:      INSERT INTO <table> (payload) VALUES (%s)
+#   PostgreSQL: INSERT INTO <table> (k, c, pad) VALUES (%s, %s, %s) RETURNING id
+#   MySQL:      INSERT INTO <table> (k, c, pad) VALUES (%s, %s, %s)
 #
-# UPDATE (only `payload` in run.update_columns here):
-#   UPDATE <table> SET payload = %s WHERE id = %s
-#   -- empty-table fallback uses MAX(id) subquery instead of random id
-#
-# DELETE:
-#   DELETE FROM <table> WHERE id = %s
-#   -- same empty-table fallback as UPDATE when needed
-#
-# `transaction.shape: single` ⇒ one of the above + commit per iteration (per backend rules).
+# UPDATE (default run.update_columns is k + c):
+#   UPDATE <table> SET k = %s, c = %s WHERE id = %s
 
 workload:
   transaction:

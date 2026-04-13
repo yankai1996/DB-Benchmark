@@ -3,12 +3,13 @@
 
 prepare:
   indexes:
-    - name: created
-      columns: [created_at]
+    - name: k
+      columns: [k]
 
 run:
   update_columns:
-    - payload
+    - k
+    - c
 
 workload:
   transaction:
@@ -20,19 +21,24 @@ workload:
       weight: 5.0
       kind: select
       sql: "SELECT {select_list} FROM {table} WHERE id = %s"
+      bind: [row_id]
     - id: range_select
       weight: 2.0
       kind: select
       sql: "SELECT {select_list} FROM {table} WHERE id BETWEEN %s AND %s"
+      bind: [range_pair]
     - id: point_update
       weight: 0.8
       kind: update
-      sql: "UPDATE {table} SET payload = %s WHERE id = %s"
+      sql: "UPDATE {table} SET k = %s, c = %s WHERE id = %s"
+      bind: [col:k, col:c, row_id]
     - id: point_delete
       weight: 1.0
       kind: delete
       sql: "DELETE FROM {table} WHERE id = %s"
+      bind: [row_id]
     - id: insert_row
       weight: 1.0
       kind: insert
-      sql: "INSERT INTO {table} (payload) VALUES (%s)"
+      sql: "INSERT INTO {table} (k, c, pad) VALUES (%s, %s, %s)"
+      bind: [col:k, col:c, col:pad]

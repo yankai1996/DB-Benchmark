@@ -40,17 +40,21 @@ class TestExecuteStatementTemplate(unittest.TestCase):
             "select",
             "SELECT {select_list} FROM {table} WHERE id = %s",
             None,
+            ("row_id",),
         )
         pk_hi = {"t1": 10}
+        extra: dict = {}
 
         def ri(a: int, b: int) -> int:
             return 3
 
-        execute_statement_template(cur, tmpl, "t1", pk_hi, ri, None, "id, payload", 100)
+        execute_statement_template(
+            cur, tmpl, "t1", pk_hi, ri, None, "id, k, c", 100, extra
+        )
         self.assertEqual(len(cur.executes), 1)
         sql, params = cur.executes[0]
         self.assertIn("FROM t1", sql)
-        self.assertIn("id, payload", sql)
+        self.assertIn("id, k, c", sql)
         self.assertEqual(params, (3,))
 
     def test_select_range_two_params(self) -> None:
@@ -61,13 +65,17 @@ class TestExecuteStatementTemplate(unittest.TestCase):
             "select",
             "SELECT {select_list} FROM {table} WHERE id BETWEEN %s AND %s",
             None,
+            ("range_pair",),
         )
         pk_hi = {"t1": 500}
+        extra: dict = {}
 
         def ri(a: int, b: int) -> int:
             return 42
 
-        execute_statement_template(cur, tmpl, "t1", pk_hi, ri, None, "id, payload", 100)
+        execute_statement_template(
+            cur, tmpl, "t1", pk_hi, ri, None, "id, k, c", 100, extra
+        )
         self.assertEqual(len(cur.executes), 1)
         _sql, params = cur.executes[0]
         self.assertIsNotNone(params)
@@ -79,23 +87,37 @@ class TestExecuteStatementTemplate(unittest.TestCase):
         cur = _MockCursor()
         cur.lastrowid = 42
         tmpl = StatementTemplate(
-            "i1", 1.0, "insert", "INSERT INTO {table} (payload) VALUES (%s)", None
+            "i1",
+            1.0,
+            "insert",
+            "INSERT INTO {table} (c) VALUES (%s)",
+            None,
+            ("col:c",),
         )
         pk_hi: dict = {"t1": 0}
+        extra: dict = {}
 
-        execute_statement_template(cur, tmpl, "t1", pk_hi, lambda a, b: 1, None, "id", 100)
+        execute_statement_template(
+            cur, tmpl, "t1", pk_hi, lambda a, b: 1, None, "id", 100, extra
+        )
         self.assertEqual(pk_hi["t1"], 42)
 
     def test_select_rid_missing_raises(self) -> None:
         cur = _MockCursor()
         tmpl = StatementTemplate(
-            "s1", 1.0, "select", "SELECT 1 FROM {table} WHERE id = %s", None
+            "s1",
+            1.0,
+            "select",
+            "SELECT 1 FROM {table} WHERE id = %s",
+            None,
+            ("row_id",),
         )
         pk_hi = {"t1": 0}
+        extra: dict = {}
 
         with self.assertRaises(RuntimeError):
             execute_statement_template(
-                cur, tmpl, "t1", pk_hi, lambda a, b: 1, None, "id", 100
+                cur, tmpl, "t1", pk_hi, lambda a, b: 1, None, "id", 100, extra
             )
 
 

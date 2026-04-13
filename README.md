@@ -124,7 +124,7 @@ python3 db_bench.py -c mybench.yaml cleanup
 - **`workload`**：**Mix 轨**（**`mix.single`** / **`mix.multi`**，与 **`transaction.shape`** 一致）或 **模板轨**（非空 **`statements`**，每项 **`id`、`weight`、`kind`**，可选 **`sql`**）。两轨 **互斥**。若省略 **`workload:`**，解析结果与内置 **`default_workload_spec`** 相同。**`run`** 的 **CLI 比例参数**可覆盖该次运行使用的数值。
 - **模板轨自定义 `sql`**（省略 `sql` 则仍用内置语句）：
   - 占位符：**`{table}`** 替换为当前随机到的物理表名；**`{select_list}`** 替换为与内置 SELECT 相同的列列表（`id` 与 **`run.update_columns`**）。
-  - 参数占位符为 **DB-API 风格 `%s`**（字面 `%` 请写成 `%%`）。条数规则：**`select`**：`0`、`1`（点查 `id`）或 **`2`（范围查，如 `BETWEEN %s AND %s`）**；**`delete`**：`0` 或 `1`；**`insert`**：`0` 或 `1`（`payload`）；**`update`**：`0`、`1` 或 `2`（`payload`、`id`）。范围查时程序在 **`[1, 当前表上界]`** 内随机一段长度 **`range_size`** 的闭区间（上界不足时缩短为 **`[1, top]`**）；**`workload.range_size`**（默认 `100`，与常见 sysbench 一致）可被 **`run --range-size`** 或单条 **`statements[].range_size`** 覆盖。无行时范围查会报错计入 **`errors`**。点查无上界时同上。
+  - 参数占位符为 **DB-API 风格 `%s`**（字面 `%` 请写成 `%%`）。**一旦写了 `sql`，必须同时写 `bind`**（数组；无占位符时写 `bind: []`）：声明每个 `%s` 如何取值，例如 **`row_id`**（点查主键）、**`range_pair`**（范围查两段 `BETWEEN`，宽度由 **`workload.range_size`** / 语句级 **`range_size`** 决定）、**`col:<列名>`**（按列类型生成一列的值，如 **`col:k`** / **`col:c`** / **`col:pad`**）。详见 **`models/workload_bind_spec.md`**。
   - **INSERT** 后程序会尝试用 **`lastrowid`**（MySQL）或 **`RETURNING` 首列**（PostgreSQL：请在 SQL 中写 **`RETURNING id`** 以便更新线程内主键上界）刷新上界。
 - 详见 **`models/example.yaml`**、**`models/default.yaml`**、**`models/template_track_example.yaml`**、**[`models/template_custom_sql_example.yaml`](models/template_custom_sql_example.yaml)**、**`models/README.md`**。
 
@@ -134,8 +134,8 @@ python3 db_bench.py -c mybench.yaml cleanup
 
 - **查 SELECT（表内已有主键上界时）**：`SELECT … FROM <表> WHERE id = ?`，`id` 在 `1..上界` 内均匀随机（类似 sysbench 点查主键）。上界来自 **`prepare` 预置行数**（`--table-size`），以及**本线程**成功插入后观测到的最大 `id`。
 - **查（表仍空、上界为 0）**：`SELECT … ORDER BY id DESC LIMIT 1`。
-- **增 INSERT**：插入一行新 `payload`；PostgreSQL 用 `RETURNING id`、MySQL 用 `lastrowid` 更新本线程上界。
-- **改 UPDATE**：按当前 model 的 **`run.update_columns`** 更新列（默认仅 `payload`）；`id` 的选取方式与点查相同；表空时用 `WHERE id = (SELECT MAX(id) FROM 表)`，可能更新 0 行。
+- **增 INSERT**：默认插入一行 `k,c,pad`；PostgreSQL 用 `RETURNING id`、MySQL 用 `lastrowid` 更新本线程上界。
+- **改 UPDATE**：按当前 model 的 **`run.update_columns`** 更新列（默认 `k,c`）；`id` 的选取方式与点查相同；表空时用 `WHERE id = (SELECT MAX(id) FROM 表)`，可能更新 0 行。
 - **删 DELETE**：`DELETE … WHERE id = ?`（同上；表空时用 `WHERE id = (SELECT MAX(id) FROM 表)`）。
 
 **比例**：`--select-ratio` 等为**权重**，四者之和归一化后抽样。**基准值**来自当前 **`--model`** 解析出的 **`workload`**；**`run` 的 CLI** 传入则覆盖。归一化后仅 SELECT 非零为只读；仅 INSERT 非零为只写；否则为 OLTP。

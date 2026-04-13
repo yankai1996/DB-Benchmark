@@ -8,8 +8,9 @@ from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MAX_IDENT_LEN = 63
+_COL_BIND_PREFIX_RE = re.compile(r"^col:[A-Za-z_][A-Za-z0-9_]*$")
 
-_BUILTIN_COLS = frozenset({"id", "payload", "created_at"})
+_BUILTIN_COLS = frozenset({"id", "k", "c", "pad"})
 
 
 def _check_ident(name: str, what: str) -> None:
@@ -51,11 +52,23 @@ class StatementTemplate:
     kind: str  # select | insert | update | delete
     sql: Optional[str]
     range_size: Optional[int]  # select + 2x %s: override workload.range_size for BETWEEN width
+    bind: Tuple[str, ...]  # required when sql is set: row_id | range_pair | col:<name>
+
+
+@dataclass(frozen=True)
+class SequenceStep:
+    """One step in workload.sequence: fixed order, no weights (multi-statement transactions only)."""
+
+    id: str
+    kind: str  # select | insert | update | delete
+    sql: Optional[str]
+    range_size: Optional[int]
+    bind: Tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class WorkloadSpec:
-    """Transaction shape + either mix weights or statement templates (mutually exclusive)."""
+    """Transaction shape + mix weights, weighted templates, or fixed sequence (mutually exclusive)."""
 
     shape: str  # single | multi
     statement_count: int  # used when shape == multi (>= 1)
@@ -63,6 +76,7 @@ class WorkloadSpec:
     mix_multi: Tuple[float, float, float, float]
     statements: Tuple[StatementTemplate, ...]  # non-empty => template track
     range_size: int  # template SELECT with two %s (BETWEEN low/high); default 100 (sysbench-like)
+    sequence: Tuple[SequenceStep, ...]  # non-empty => fixed-order multi track
 
 
 def default_workload_spec() -> WorkloadSpec:
@@ -73,6 +87,7 @@ def default_workload_spec() -> WorkloadSpec:
         mix_multi=(5.0, 1.0, 1.0, 1.0),
         statements=(),
         range_size=100,
+        sequence=(),
     )
 
 
@@ -91,7 +106,7 @@ def default_bench_model() -> BenchModel:
     return BenchModel(
         extra_columns=(),
         indexes=(),
-        run_update_columns=("payload",),
+        run_update_columns=("k", "c"),
         run_extensions=(),
         workload=default_workload_spec(),
     )
@@ -124,6 +139,26 @@ def _coerce_pos_int(name: str, raw: object) -> int:
     if n < 1:
         raise SystemExit(f"{name} must be >= 1")
     return n
+
+
+def _parse_bind_list(raw: object, where: str) -> Tuple[str, ...]:
+    """Declarative bind atoms: row_id, range_pair, col:<column>. See models/workload_bind_spec.md."""
+    if not isinstance(raw, list):
+        raise SystemExit(f"{where} must be a list")
+    out: List[str] = []
+    for i, x in enumerate(raw):
+        if not isinstance(x, str) or not x.strip():
+            raise SystemExit(f"{where}[{i}] must be a non-empty string")
+        atom = x.strip()
+        if atom in ("row_id", "range_pair"):
+            out.append(atom)
+        elif _COL_BIND_PREFIX_RE.match(atom):
+            out.append(atom)
+        else:
+            raise SystemExit(
+                f"{where}[{i}] must be 'row_id', 'range_pair', or 'col:<column>' (got {x!r})"
+            )
+    return tuple(out)
 
 
 def _parse_workload_range_size(raw: object) -> int:
@@ -172,7 +207,55 @@ def _parse_statement_template(raw: object, idx: int) -> StatementTemplate:
     rs_stmt: Optional[int] = None
     if raw.get("range_size") is not None:
         rs_stmt = _coerce_pos_int(f"workload.statements[{idx}].range_size", raw.get("range_size"))
-    return StatementTemplate(tid.strip(), float(w), kind, sql, rs_stmt)
+    bind_raw = raw.get("bind")
+    if sql is not None:
+        if bind_raw is None:
+            raise SystemExit(f"workload.statements[{idx}].bind is required when sql is set")
+        bind = _parse_bind_list(bind_raw, f"workload.statements[{idx}].bind")
+    else:
+        if bind_raw is not None:
+            raise SystemExit(f"workload.statements[{idx}].bind must be omitted when sql is omitted")
+        bind = ()
+    return StatementTemplate(tid.strip(), float(w), kind, sql, rs_stmt, bind)
+
+
+def _parse_sequence_step(raw: object, idx: int) -> SequenceStep:
+    if not isinstance(raw, dict):
+        raise SystemExit(f"workload.sequence[{idx}] must be a mapping")
+    tid = raw.get("id")
+    if not isinstance(tid, str) or not tid.strip():
+        raise SystemExit(f"workload.sequence[{idx}].id is required")
+    kind_raw = raw.get("kind")
+    if not isinstance(kind_raw, str) or not kind_raw.strip():
+        raise SystemExit(f"workload.sequence[{idx}].kind is required")
+    kind = kind_raw.strip().lower()
+    if kind not in ("select", "insert", "update", "delete"):
+        raise SystemExit(
+            f"workload.sequence[{idx}].kind must be select, insert, update, or delete "
+            f"(got {kind_raw!r})"
+        )
+    sql_raw = raw.get("sql")
+    sql: Optional[str]
+    if sql_raw is None or sql_raw == "":
+        sql = None
+    elif isinstance(sql_raw, str):
+        s = sql_raw.strip()
+        sql = None if not s else s
+    else:
+        raise SystemExit(f"workload.sequence[{idx}].sql must be a string or omitted")
+    rs_stmt: Optional[int] = None
+    if raw.get("range_size") is not None:
+        rs_stmt = _coerce_pos_int(f"workload.sequence[{idx}].range_size", raw.get("range_size"))
+    bind_raw = raw.get("bind")
+    if sql is not None:
+        if bind_raw is None:
+            raise SystemExit(f"workload.sequence[{idx}].bind is required when sql is set")
+        bind = _parse_bind_list(bind_raw, f"workload.sequence[{idx}].bind")
+    else:
+        if bind_raw is not None:
+            raise SystemExit(f"workload.sequence[{idx}].bind must be omitted when sql is omitted")
+        bind = ()
+    return SequenceStep(tid.strip(), kind, sql, rs_stmt, bind)
 
 
 def parse_workload(raw: object) -> WorkloadSpec:
@@ -201,6 +284,32 @@ def parse_workload(raw: object) -> WorkloadSpec:
     d = default_workload_spec()
     wrs = _parse_workload_range_size(raw.get("range_size"))
 
+    seq_raw = raw.get("sequence")
+    if seq_raw is not None:
+        if not isinstance(seq_raw, list):
+            raise SystemExit("workload.sequence must be a list")
+        if len(seq_raw) < 1:
+            raise SystemExit("workload.sequence must be non-empty")
+        if has_nonempty_statements:
+            raise SystemExit("workload.statements must be empty when workload.sequence is set")
+        if "mix" in raw:
+            raise SystemExit("workload.mix must not appear when workload.sequence is non-empty")
+        if shape != "multi":
+            raise SystemExit("workload.transaction.shape must be multi when workload.sequence is set")
+        steps = tuple(_parse_sequence_step(x, i) for i, x in enumerate(seq_raw))
+        n = len(steps)
+        sc = tx.get("statement_count")
+        if sc is None:
+            n_st = n
+        else:
+            n_st = _coerce_pos_int("workload.transaction.statement_count", sc)
+            if n_st != n:
+                raise SystemExit(
+                    f"workload.transaction.statement_count ({n_st}) must equal "
+                    f"len(workload.sequence) ({n})"
+                )
+        return WorkloadSpec("multi", n_st, d.mix_single, d.mix_multi, (), wrs, steps)
+
     if has_nonempty_statements:
         if "mix" in raw:
             raise SystemExit(
@@ -214,9 +323,9 @@ def parse_workload(raw: object) -> WorkloadSpec:
         if shape == "single":
             if "statement_count" in tx:
                 raise SystemExit("workload.transaction.statement_count is not allowed when shape is single")
-            return WorkloadSpec("single", d.statement_count, d.mix_single, d.mix_multi, templates, wrs)
+            return WorkloadSpec("single", d.statement_count, d.mix_single, d.mix_multi, templates, wrs, ())
         n_st = _coerce_pos_int("workload.transaction.statement_count", tx.get("statement_count"))
-        return WorkloadSpec("multi", n_st, d.mix_single, d.mix_multi, templates, wrs)
+        return WorkloadSpec("multi", n_st, d.mix_single, d.mix_multi, templates, wrs, ())
 
     mix = raw.get("mix")
     if not isinstance(mix, dict):
@@ -230,7 +339,7 @@ def parse_workload(raw: object) -> WorkloadSpec:
         ms = _parse_mix_weights(mix["single"], "workload.mix.single")
         if "statement_count" in tx:
             raise SystemExit("workload.transaction.statement_count is not allowed when shape is single")
-        return WorkloadSpec("single", d.statement_count, ms, d.mix_multi, (), wrs)
+        return WorkloadSpec("single", d.statement_count, ms, d.mix_multi, (), wrs, ())
 
     if "single" in mix:
         raise SystemExit("workload.mix.single is not allowed when transaction.shape is multi")
@@ -238,7 +347,7 @@ def parse_workload(raw: object) -> WorkloadSpec:
         raise SystemExit("workload.mix.multi is required when transaction.shape is multi")
     mm = _parse_mix_weights(mix["multi"], "workload.mix.multi")
     n_st = _coerce_pos_int("workload.transaction.statement_count", tx.get("statement_count"))
-    return WorkloadSpec("multi", n_st, d.mix_single, mm, (), wrs)
+    return WorkloadSpec("multi", n_st, d.mix_single, mm, (), wrs, ())
 
 
 def _load_yaml(path: str) -> dict:
@@ -297,7 +406,8 @@ def _parse_extra_column(raw: dict, idx: int) -> ExtraColumn:
         if default is None:
             raise SystemExit(
                 f"prepare.extra_columns[{idx}]: not_null requires `default` "
-                "(run/insert only sets payload; other columns need a default)"
+                    "(run/insert only sets built-in columns and explicitly updated extras; "
+                    "other columns need a default)"
             )
         if typ in ("int", "bigint"):
             if not isinstance(default, int):
@@ -343,7 +453,7 @@ def _parse_run_section(
 ) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, Any], ...]]:
     """Parse `run` block; unknown keys are preserved in run_extensions."""
     if run_raw is None:
-        return (("payload",), ())
+        return (("k", "c"), ())
     if not isinstance(run_raw, dict):
         raise SystemExit("run: must be a mapping when present")
 
@@ -361,7 +471,7 @@ def _parse_run_section(
 
     uc = run_raw.get("update_columns")
     if uc is None:
-        run_cols = ("payload",)
+        run_cols = ("k", "c")
     elif not isinstance(uc, list) or len(uc) == 0:
         raise SystemExit("run.update_columns: must be a non-empty list when set")
     else:
@@ -380,7 +490,7 @@ def _parse_run_section(
             run_cols_list.append(c)
         run_cols = tuple(run_cols_list)
 
-    updatable = frozenset({"payload", "created_at"}) | {e.name for e in extras}
+    updatable = frozenset({"k", "c", "pad"}) | {e.name for e in extras}
     for c in run_cols:
         if c not in updatable:
             raise SystemExit(

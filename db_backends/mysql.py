@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from typing import List, Optional
 
 from db_backends.base import Backend
@@ -38,17 +39,19 @@ class MySQLBackend(Backend):
         return f"""
     CREATE TABLE IF NOT EXISTS {table} (
         id BIGINT AUTO_INCREMENT PRIMARY KEY,
-        payload TEXT NOT NULL,
-        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-        INDEX idx_{table}_created (created_at)
+        k BIGINT NOT NULL DEFAULT 0,
+        c CHAR(120) NOT NULL DEFAULT '',
+        pad CHAR(60) NOT NULL DEFAULT '',
+        INDEX idx_{table}_k (k)
     );
     """
 
     def prepare_model_statements(self, table: str, model: BenchModel) -> List[str]:
         body = [
             "id BIGINT AUTO_INCREMENT PRIMARY KEY",
-            "payload TEXT NOT NULL",
-            "created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
+            "k BIGINT NOT NULL DEFAULT 0",
+            "c CHAR(120) NOT NULL DEFAULT ''",
+            "pad CHAR(60) NOT NULL DEFAULT ''",
         ]
         body.extend(self.render_extra_column_definition(e) for e in model.extra_columns)
         lines = [
@@ -89,19 +92,24 @@ class MySQLBackend(Backend):
 
     def fill_table(self, cur, table: str, n: int) -> None:
         off = 0
+        k_hi = max(1, n)
         while off < n:
             m = min(_MYSQL_FILL_CHUNK, n - off)
-            rows = [(f"b{off + i}",) for i in range(m)]
-            cur.executemany(f"INSERT INTO {table} (payload) VALUES (%s)", rows)
+            rows = [
+                (
+                    random.randint(1, k_hi),
+                    f"c{off + i}",
+                    f"p{off + i}",
+                )
+                for i in range(m)
+            ]
+            cur.executemany(f"INSERT INTO {table} (k, c, pad) VALUES (%s, %s, %s)", rows)
             off += m
 
-    def format_created_at_assignment(self) -> str:
-        return "created_at = CURRENT_TIMESTAMP(6)"
-
-    def run_insert_returning_id(self, cur, table: str, payload: str) -> Optional[int]:
+    def run_insert_returning_id(self, cur, table: str, k: int, c: str, pad: str) -> Optional[int]:
         cur.execute(
-            f"INSERT INTO {table} (payload) VALUES (%s)",
-            (payload,),
+            f"INSERT INTO {table} (k, c, pad) VALUES (%s, %s, %s)",
+            (k, c, pad),
         )
         lid = cur.lastrowid
         return int(lid) if lid else None

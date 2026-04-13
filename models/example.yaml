@@ -2,38 +2,25 @@
 #   python3 db_bench.py prepare --model models/example.yaml ...
 #   python3 db_bench.py run --model models/example.yaml ...
 # (or set `model: models/example.yaml` in the main bench config YAML).
-#
-# `prepare` uses prepare.*; `run` uses run.update_columns (and ignores unknown run.* keys
-# for now — they are preserved in memory for future SQL / workload extensions).
-#
-# Table stem / count / row fill still come from CLI: --table, --tables, --table-size.
 
 prepare:
-  # Extra columns beyond id, payload, created_at. Declare them here so run.update_columns
-  # can reference them (types drive generated UPDATE values).
+  # Extra columns beyond built-ins id, k, c, pad.
   extra_columns:
-    - name: k
-      type: int
+    - name: ext_note
+      type: varchar
+      length: 64
       not_null: true
-      default: 0
+      default: ''
 
-  # Indexes to create after the table. `name` is a short logical name; the actual
-  # index name in SQL is `{table}_{name}` so names stay unique across tables in PostgreSQL.
   indexes:
     - name: k
       columns: [k]
-    - name: created_at
-      columns: [created_at]
-    # Example of a multi-column or unique index:
-    # - name: k_created
-    #   columns: [k, created_at]
-    #   unique: false
+    - name: ext_note
+      columns: [ext_note]
 
 run:
-  # Columns SET by benchmark UPDATEs (order preserved). Built-ins: payload, created_at;
-  # others must appear in prepare.extra_columns.
+  # Built-ins for default sbtest-like table: k, c, pad.
   update_columns:
-    - payload
     - k
-  # Future: optional keys under `run` for custom SQL / statement templates will be ignored
-  # by the current binary but kept in BenchModel.run_extensions for tooling.
+    - c
+    - ext_note

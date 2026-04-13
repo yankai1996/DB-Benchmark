@@ -50,14 +50,10 @@ class Backend(ABC):
 
     @abstractmethod
     def fill_table(self, cur, table: str, n: int) -> None:
-        """Insert n benchmark rows when table is empty (payload only)."""
+        """Insert n benchmark rows when table is empty."""
 
     @abstractmethod
-    def format_created_at_assignment(self) -> str:
-        """Single SET clause fragment, e.g. ``created_at = NOW()`` (no leading comma)."""
-
-    @abstractmethod
-    def run_insert_returning_id(self, cur, table: str, payload: str) -> Optional[int]:
+    def run_insert_returning_id(self, cur, table: str, k: int, c: str, pad: str) -> Optional[int]:
         """INSERT one row; return new primary key if known."""
 
     @abstractmethod
@@ -76,18 +72,23 @@ class Backend(ABC):
         self,
         update_columns: Tuple[str, ...],
         extra_by_name: Dict[str, ExtraColumn],
-        payload_value: str,
         randint: Callable[[int, int], int],
+        k_upper_bound: int,
     ) -> Tuple[List[str], List[object]]:
         """SET fragments and params for benchmark UPDATE (shared PG/MySQL SQL)."""
         parts: List[str] = []
         params: List[object] = []
+        k_hi = max(1, k_upper_bound)
         for col in update_columns:
-            if col == "payload":
-                parts.append("payload = %s")
-                params.append(payload_value)
-            elif col == "created_at":
-                parts.append(self.format_created_at_assignment())
+            if col == "k":
+                parts.append("k = %s")
+                params.append(randint(1, k_hi))
+            elif col == "c":
+                parts.append("c = %s")
+                params.append(f"c{threading.get_ident()}-{time.time_ns()}")
+            elif col == "pad":
+                parts.append("pad = %s")
+                params.append(f"p{threading.get_ident()}-{time.time_ns()}")
             else:
                 ex = extra_by_name.get(col)
                 if ex is None:
@@ -144,14 +145,15 @@ class Backend(ABC):
                 )
                 cur.fetchone()
         elif op == "insert":
-            payload = f"w{threading.get_ident()}-{time.time_ns()}"
-            new_id = self.run_insert_returning_id(cur, tbl, payload)
+            k = randint(1, max(1, top))
+            c = f"c{threading.get_ident()}-{time.time_ns()}"
+            pad = f"p{threading.get_ident()}-{time.time_ns()}"
+            new_id = self.run_insert_returning_id(cur, tbl, k, c, pad)
             if new_id is not None and new_id > pk_hi[tbl]:
                 pk_hi[tbl] = new_id
         elif op == "update":
-            pl = f"u{threading.get_ident()}-{time.time_ns()}"
             parts, params = self.build_update_set_parts(
-                update_columns, extra_by_name, pl, randint
+                update_columns, extra_by_name, randint, top
             )
             set_sql = ", ".join(parts)
             if fixed_rid is not None:

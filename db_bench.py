@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from bench_model import (
     BenchModel,
     ExtraColumn,
+    SequenceStep,
     StatementTemplate,
     WorkloadSpec,
     default_bench_model,
@@ -159,6 +160,25 @@ def resolve_bench_model(model_path: str) -> BenchModel:
     return load_bench_model(str(p.resolve()))
 
 
+def _aggregate_sequence_ratios(
+    steps: Tuple[SequenceStep, ...],
+) -> Tuple[float, float, float, float]:
+    n = len(steps)
+    if n == 0:
+        return (0.25, 0.25, 0.25, 0.25)
+    sel = ins = upd = dele = 0
+    for s in steps:
+        if s.kind == "select":
+            sel += 1
+        elif s.kind == "insert":
+            ins += 1
+        elif s.kind == "update":
+            upd += 1
+        else:
+            dele += 1
+    return (sel / n, ins / n, upd / n, dele / n)
+
+
 def _aggregate_template_ratios(
     stmts: Tuple[StatementTemplate, ...],
 ) -> Tuple[float, float, float, float]:
@@ -182,6 +202,19 @@ def apply_model_workload_to_merged(merged: Dict[str, Any], w: WorkloadSpec) -> N
     """Overlay ratio/txn keys from model workload (before CLI parse)."""
     merged["range_size"] = w.range_size
     p = _PROGRAM_DEFAULTS
+    if w.sequence:
+        s, ins, upd, dele = _aggregate_sequence_ratios(w.sequence)
+        merged["select_ratio"] = s
+        merged["insert_ratio"] = ins
+        merged["update_ratio"] = upd
+        merged["delete_ratio"] = dele
+        merged["txn_select_ratio"] = s
+        merged["txn_insert_ratio"] = ins
+        merged["txn_update_ratio"] = upd
+        merged["txn_delete_ratio"] = dele
+        merged["txn_mode"] = "multi"
+        merged["txn_statements"] = w.statement_count
+        return
     if w.statements:
         s, ins, upd, dele = _aggregate_template_ratios(w.statements)
         merged["select_ratio"] = s
@@ -513,6 +546,7 @@ class BenchConfig:
     update_columns: Tuple[str, ...]
     extra_columns: Tuple[ExtraColumn, ...]
     statement_templates: Tuple[StatementTemplate, ...] = field(default_factory=tuple)
+    statement_sequence: Tuple[SequenceStep, ...] = field(default_factory=tuple)
     range_size: int = 100
 
 
@@ -720,6 +754,83 @@ def _update_pk_hi_after_insert(cur, tbl: str, pk_hi: Dict[str, int]) -> None:
             pk_hi[tbl] = max(pk_hi.get(tbl, 0), int(row[0]))
 
 
+def _sequence_step_to_template(step: SequenceStep) -> StatementTemplate:
+    return StatementTemplate(step.id, 1.0, step.kind, step.sql, step.range_size, step.bind)
+
+
+def _bind_expanded_arity(bind: Tuple[str, ...]) -> int:
+    n = 0
+    for atom in bind:
+        n += 2 if atom == "range_pair" else 1
+    return n
+
+
+def _bind_column_value(
+    col: str,
+    extra_by_name: Dict[str, ExtraColumn],
+    randint: Callable[[int, int], int],
+    k_upper_bound: int,
+) -> object:
+    """Single %s value for ``col:<column>`` (see models/workload_bind_spec.md)."""
+    if col == "id":
+        raise RuntimeError("use bind atom row_id for primary key, not col:id")
+    if col == "k":
+        return randint(1, max(1, k_upper_bound))
+    if col == "c":
+        return f"c{threading.get_ident()}-{time.time_ns()}"
+    if col == "pad":
+        return f"p{threading.get_ident()}-{time.time_ns()}"
+    ex = extra_by_name.get(col)
+    if ex is None:
+        raise RuntimeError(
+            f"unknown column {col!r} for col: bind (expected built-in k/c/pad "
+            f"or prepare.extra_columns name)"
+        )
+    k = ex.sql_kind
+    if k in ("int", "bigint"):
+        return randint(0, 2_147_483_647)
+    if k in ("text", "varchar"):
+        return f"u{col}-{threading.get_ident()}-{time.time_ns()}"
+    raise RuntimeError(f"Unsupported extra column sql_kind for col: bind: {k!r}")
+
+
+def _expand_bind_params(
+    bind: Tuple[str, ...],
+    tmpl: StatementTemplate,
+    tbl: str,
+    pk_hi: Dict[str, int],
+    randint: Callable[[int, int], int],
+    fixed_rid: Optional[int],
+    workload_range_size: int,
+    extra_by_name: Dict[str, ExtraColumn],
+) -> Tuple[object, ...]:
+    rid = _resolve_template_rid(tbl, pk_hi, randint, fixed_rid)
+    top = pk_hi.get(tbl, 0)
+    out: List[object] = []
+    for atom in bind:
+        if atom == "row_id":
+            if rid is None:
+                raise RuntimeError(
+                    f"workload statement {tmpl.id!r}: row_id requires at least one row in {tbl!r} "
+                    f"(prepare with --table-size > 0)"
+                )
+            out.append(rid)
+        elif atom == "range_pair":
+            if top < 1:
+                raise RuntimeError(
+                    f"workload statement {tmpl.id!r}: range_pair needs at least one row in {tbl!r}"
+                )
+            eff_rs = tmpl.range_size if tmpl.range_size is not None else workload_range_size
+            lo, hi = _template_range_bounds(randint, top, eff_rs)
+            out.extend((lo, hi))
+        elif atom.startswith("col:"):
+            cname = atom[4:]
+            out.append(_bind_column_value(cname, extra_by_name, randint, top))
+        else:
+            raise RuntimeError(f"internal error: unknown bind atom {atom!r}")
+    return tuple(out)
+
+
 def execute_statement_template(
     cur,
     tmpl: StatementTemplate,
@@ -729,94 +840,30 @@ def execute_statement_template(
     fixed_rid: Optional[int],
     select_list_sql: str,
     workload_range_size: int,
+    extra_by_name: Dict[str, ExtraColumn],
 ) -> None:
-    """Run custom template SQL (``tmpl.sql`` non-empty). See README."""
+    """Run custom template SQL (``tmpl.sql`` non-empty) using declarative ``tmpl.bind``."""
     assert tmpl.sql
     sql = tmpl.sql.replace("{table}", tbl).replace("{select_list}", select_list_sql)
     nph = _count_s_placeholders(sql)
-    rid = _resolve_template_rid(tbl, pk_hi, randint, fixed_rid)
-    payload = f"w{threading.get_ident()}-{time.time_ns()}"
-    pl_update = f"u{threading.get_ident()}-{time.time_ns()}"
-
-    if tmpl.kind == "select":
-        if nph == 0:
-            cur.execute(sql)
-        elif nph == 1:
-            if rid is None:
-                raise RuntimeError(
-                    f"template SQL uses %s for id but table {tbl!r} has no rows yet "
-                    f"(prepare with --table-size > 0), or use SQL without %s"
-                )
-            cur.execute(sql, (rid,))
-        elif nph == 2:
-            top = pk_hi.get(tbl, 0)
-            if top < 1:
-                raise RuntimeError(
-                    f"template range SELECT needs at least one row in {tbl!r} "
-                    f"(prepare with --table-size > 0), or use 0/1 %s"
-                )
-            eff_rs = tmpl.range_size if tmpl.range_size is not None else workload_range_size
-            lo, hi = _template_range_bounds(randint, top, eff_rs)
-            cur.execute(sql, (lo, hi))
-        else:
-            raise RuntimeError(
-                f"workload statement {tmpl.id!r}: custom select SQL must use 0, 1, or 2 %s "
-                f"placeholder(s) (2 for BETWEEN low/high), got {nph}"
-            )
-        cur.fetchone()
-        return
-
-    if tmpl.kind == "insert":
-        if nph == 0:
-            cur.execute(sql)
-        elif nph == 1:
-            cur.execute(sql, (payload,))
-        else:
-            raise RuntimeError(
-                f"workload statement {tmpl.id!r}: custom insert SQL must use 0 or 1 %s placeholder(s), "
-                f"got {nph}"
-            )
-        _update_pk_hi_after_insert(cur, tbl, pk_hi)
-        return
-
-    if tmpl.kind == "update":
-        if nph == 0:
-            cur.execute(sql)
-        elif nph == 1:
-            if rid is None:
-                raise RuntimeError(
-                    f"template SQL uses %s for id but table {tbl!r} has no rows yet "
-                    f"(prepare with --table-size > 0), or use SQL without %s"
-                )
-            cur.execute(sql, (rid,))
-        elif nph == 2:
-            if rid is None:
-                raise RuntimeError(
-                    f"template SQL uses two %s placeholders (payload, id) but table {tbl!r} has "
-                    f"no rows yet (prepare with --table-size > 0)"
-                )
-            cur.execute(sql, (pl_update, rid))
-        else:
-            raise RuntimeError(
-                f"workload statement {tmpl.id!r}: custom update SQL must use 0, 1, or 2 %s "
-                f"placeholders (payload, id when 2), got {nph}"
-            )
-        return
-
+    bind = tmpl.bind
+    exp_arity = _bind_expanded_arity(bind)
+    if exp_arity != nph:
+        raise RuntimeError(
+            f"workload statement {tmpl.id!r}: bind expands to {exp_arity} %s value(s) "
+            f"but SQL has {nph} placeholder(s)"
+        )
     if nph == 0:
         cur.execute(sql)
-    elif nph == 1:
-        if rid is None:
-            raise RuntimeError(
-                f"template SQL uses %s for id but table {tbl!r} has no rows yet "
-                f"(prepare with --table-size > 0), or use SQL without %s"
-            )
-        cur.execute(sql, (rid,))
     else:
-        raise RuntimeError(
-            f"workload statement {tmpl.id!r}: custom delete SQL must use 0 or 1 %s placeholder(s), "
-            f"got {nph}"
+        params = _expand_bind_params(
+            bind, tmpl, tbl, pk_hi, randint, fixed_rid, workload_range_size, extra_by_name
         )
+        cur.execute(sql, params)
+    if tmpl.kind == "select":
+        cur.fetchone()
+    elif tmpl.kind == "insert":
+        _update_pk_hi_after_insert(cur, tbl, pk_hi)
 
 
 def worker_loop(
@@ -831,9 +878,10 @@ def worker_loop(
     end_time: float,
     result: WorkerResult,
     live: Optional[LiveStats] = None,
-    update_columns: Tuple[str, ...] = ("payload",),
+    update_columns: Tuple[str, ...] = ("k", "c"),
     extra_columns: Tuple[ExtraColumn, ...] = (),
     statement_templates: Tuple[StatementTemplate, ...] = (),
+    statement_sequence: Tuple[SequenceStep, ...] = (),
     range_size: int = 100,
 ) -> None:
     conn = None
@@ -857,8 +905,19 @@ def worker_loop(
     select_list_sql = workload_select_columns(update_columns)
     nt = len(table_names)
     txn_multi = txn_mode == "multi"
+    use_fixed_sequence = len(statement_sequence) > 0
     use_templates = len(statement_templates) > 0
     connection_lost = False
+    cur = None
+
+    def _drop_cursor() -> None:
+        nonlocal cur
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+            cur = None
 
     try:
         while time.monotonic() < end_time:
@@ -872,6 +931,8 @@ def worker_loop(
                         if live is not None:
                             live.record_reconnect()
                     connection_lost = False
+                    _drop_cursor()
+                    cur = conn.cursor()
                 except Exception:
                     connect_fail_streak += 1
                     delay = min(1.0, 0.05 * (2 ** min(connect_fail_streak, 6)))
@@ -879,18 +940,16 @@ def worker_loop(
                     continue
 
             t0 = time.perf_counter()
-            cur = None
             try:
-                cur = conn.cursor()
                 if txn_multi:
                     backend.begin_multi_statement_transaction(cur)
                     tbl = table_names[randint(0, nt - 1)]
                     ttop = pk_hi.get(tbl, 0)
                     txn_rid = randint(1, ttop) if ttop >= 1 else None
                     stmt_ops: List[str] = []
-                    for _ in range(txn_statements):
-                        if use_templates:
-                            tmpl = _pick_statement_template(rand(), statement_templates)
+                    if use_fixed_sequence:
+                        for step in statement_sequence:
+                            tmpl = _sequence_step_to_template(step)
                             op = tmpl.kind
                             if tmpl.sql:
                                 execute_statement_template(
@@ -902,6 +961,7 @@ def worker_loop(
                                     txn_rid,
                                     select_list_sql,
                                     range_size,
+                                    extra_by_name,
                                 )
                             else:
                                 backend.execute_workload_statement(
@@ -915,20 +975,50 @@ def worker_loop(
                                     extra_by_name,
                                     select_list_sql,
                                 )
-                        else:
-                            op = _pick_crud_op(rand(), txn_crud)
-                            backend.execute_workload_statement(
-                                cur,
-                                op,
-                                tbl,
-                                pk_hi,
-                                randint,
-                                txn_rid,
-                                update_columns,
-                                extra_by_name,
-                                select_list_sql,
-                            )
-                        stmt_ops.append(op)
+                            stmt_ops.append(op)
+                    else:
+                        for _ in range(txn_statements):
+                            if use_templates:
+                                tmpl = _pick_statement_template(rand(), statement_templates)
+                                op = tmpl.kind
+                                if tmpl.sql:
+                                    execute_statement_template(
+                                        cur,
+                                        tmpl,
+                                        tbl,
+                                        pk_hi,
+                                        randint,
+                                        txn_rid,
+                                        select_list_sql,
+                                        range_size,
+                                        extra_by_name,
+                                    )
+                                else:
+                                    backend.execute_workload_statement(
+                                        cur,
+                                        op,
+                                        tbl,
+                                        pk_hi,
+                                        randint,
+                                        txn_rid,
+                                        update_columns,
+                                        extra_by_name,
+                                        select_list_sql,
+                                    )
+                            else:
+                                op = _pick_crud_op(rand(), txn_crud)
+                                backend.execute_workload_statement(
+                                    cur,
+                                    op,
+                                    tbl,
+                                    pk_hi,
+                                    randint,
+                                    txn_rid,
+                                    update_columns,
+                                    extra_by_name,
+                                    select_list_sql,
+                                )
+                            stmt_ops.append(op)
                     conn.commit()
                 else:
                     tbl = table_names[randint(0, nt - 1)]
@@ -945,6 +1035,7 @@ def worker_loop(
                                 None,
                                 select_list_sql,
                                 range_size,
+                                extra_by_name,
                             )
                         else:
                             backend.execute_workload_statement(
@@ -994,6 +1085,7 @@ def worker_loop(
                     live.record_error()
                 if _should_reconnect(e, backend):
                     connection_lost = True
+                    _drop_cursor()
                     _safe_close_conn(conn)
                     conn = None
                     time.sleep(0.05)
@@ -1002,15 +1094,11 @@ def worker_loop(
                         conn.rollback()
                     except Exception:
                         connection_lost = True
+                        _drop_cursor()
                         _safe_close_conn(conn)
                         conn = None
-            finally:
-                if cur is not None:
-                    try:
-                        cur.close()
-                    except Exception:
-                        pass
     finally:
+        _drop_cursor()
         _safe_close_conn(conn)
 
 
@@ -1139,6 +1227,7 @@ def run_bench(cfg: BenchConfig) -> WorkerResult:
                     cfg.update_columns,
                     cfg.extra_columns,
                     cfg.statement_templates,
+                    cfg.statement_sequence,
                     cfg.range_size,
                 )
                 for i in range(cfg.workers)
@@ -1193,6 +1282,7 @@ def run_bench(cfg: BenchConfig) -> WorkerResult:
                     cfg.update_columns,
                     cfg.extra_columns,
                     cfg.statement_templates,
+                    cfg.statement_sequence,
                     cfg.range_size,
                 )
                 for i in range(cfg.workers)
@@ -1288,6 +1378,15 @@ def cmd_run(args: argparse.Namespace) -> None:
         raise SystemExit("--range-size must be >= 1")
 
     bench_model = resolve_bench_model(str(args.model))
+    seq = bench_model.workload.sequence
+    if seq:
+        if args.txn_mode != "multi":
+            raise SystemExit("Models with workload.sequence require multi-statement transactions (txn_mode multi).")
+        if args.txn_statements != len(seq):
+            raise SystemExit(
+                f"--txn-statements must be {len(seq)} to match workload.sequence length "
+                f"(got {args.txn_statements})"
+            )
 
     s, ins, upd, dele = (
         args.select_ratio,
@@ -1334,6 +1433,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         update_columns=bench_model.run_update_columns,
         extra_columns=bench_model.extra_columns,
         statement_templates=bench_model.workload.statements,
+        statement_sequence=bench_model.workload.sequence,
         range_size=args.range_size,
     )
 
@@ -1348,7 +1448,9 @@ def cmd_run(args: argparse.Namespace) -> None:
         wl = "workload: read-only (select=1)"
     else:
         wl = "workload: write-only (insert=1)"
-    if bench_model.workload.statements:
+    if bench_model.workload.sequence:
+        wl += f" | track=sequence steps={len(bench_model.workload.sequence)}"
+    elif bench_model.workload.statements:
         wl += f" | track=templates slots={len(bench_model.workload.statements)}"
     else:
         wl += " | track=mix"

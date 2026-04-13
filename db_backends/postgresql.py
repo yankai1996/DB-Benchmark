@@ -33,17 +33,19 @@ class PostgreSQLBackend(Backend):
         return f"""
         CREATE TABLE IF NOT EXISTS {table} (
             id BIGSERIAL PRIMARY KEY,
-            payload TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            k BIGINT NOT NULL DEFAULT 0,
+            c CHAR(120) NOT NULL DEFAULT '',
+            pad CHAR(60) NOT NULL DEFAULT ''
         );
-        CREATE INDEX IF NOT EXISTS idx_{table}_created ON {table} (created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_{table}_k ON {table} (k);
         """
 
     def prepare_model_statements(self, table: str, model: BenchModel) -> List[str]:
         body = [
             "id BIGSERIAL PRIMARY KEY",
-            "payload TEXT NOT NULL",
-            "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            "k BIGINT NOT NULL DEFAULT 0",
+            "c CHAR(120) NOT NULL DEFAULT ''",
+            "pad CHAR(60) NOT NULL DEFAULT ''",
         ]
         body.extend(self.render_extra_column_definition(e) for e in model.extra_columns)
         lines = [
@@ -84,18 +86,17 @@ class PostgreSQLBackend(Backend):
 
     def fill_table(self, cur, table: str, n: int) -> None:
         cur.execute(
-            f"INSERT INTO {table} (payload) SELECT md5(random()::text) "
+            f"INSERT INTO {table} (k, c, pad) "
+            f"SELECT floor(random() * %s)::bigint + 1, "
+            f"left(md5(random()::text), 120), left(md5(random()::text), 60) "
             f"FROM generate_series(1, %s)",
-            (n,),
+            (max(1, n), n),
         )
 
-    def format_created_at_assignment(self) -> str:
-        return "created_at = NOW()"
-
-    def run_insert_returning_id(self, cur, table: str, payload: str) -> Optional[int]:
+    def run_insert_returning_id(self, cur, table: str, k: int, c: str, pad: str) -> Optional[int]:
         cur.execute(
-            f"INSERT INTO {table} (payload) VALUES (%s) RETURNING id",
-            (payload,),
+            f"INSERT INTO {table} (k, c, pad) VALUES (%s, %s, %s) RETURNING id",
+            (k, c, pad),
         )
         row = cur.fetchone()
         if row:

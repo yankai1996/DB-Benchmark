@@ -4,7 +4,7 @@ Convert a small subset of DDL (CREATE TABLE / CREATE INDEX) into a bench model Y
 
 Recognized column types map to model: int, bigint, text, varchar(n).
 Any other type (e.g. TIMESTAMP, JSON, DECIMAL) is emitted as varchar(128) with a stderr warning.
-Built-in columns id, payload, created_at are skipped. SERIAL/BIGSERIAL/GENERATED lines are still skipped.
+Built-in columns id, k, c, pad are skipped. SERIAL/BIGSERIAL/GENERATED lines are still skipped.
 
 Indexes: only standalone ``CREATE [UNIQUE] INDEX ... ON table (cols)`` — not inline
 ``INDEX (...)`` inside ``CREATE TABLE`` (MySQL).
@@ -21,7 +21,7 @@ import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-_BUILTIN = frozenset({"id", "payload", "created_at"})
+_BUILTIN = frozenset({"id", "k", "c", "pad"})
 
 
 def _strip_comments(sql: str) -> str:
@@ -285,7 +285,7 @@ def ddl_to_model_dict(sql: str) -> Tuple[Dict[str, Any], List[str]]:
 
     indexes = _parse_indexes(sql)
 
-    run_cols = ["payload"] + [c["name"] for c in extra_columns if "name" in c]
+    run_cols = ["k", "c"] + [c["name"] for c in extra_columns if "name" in c]
 
     model: Dict[str, Any] = {
         "prepare": {
@@ -300,7 +300,7 @@ def ddl_to_model_dict(sql: str) -> Tuple[Dict[str, Any], List[str]]:
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Convert CREATE TABLE / CREATE INDEX DDL to a db_bench model YAML.",
-        epilog="Limitations: id/payload/created_at skipped; SERIAL/BIGSERIAL/GENERATED skipped; "
+        epilog="Limitations: id/k/c/pad skipped; SERIAL/BIGSERIAL/GENERATED skipped; "
         "other unknown types become varchar(128) with a warning; inline INDEX in CREATE TABLE not supported.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

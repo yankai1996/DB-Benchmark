@@ -4,12 +4,13 @@
 
 prepare:
   indexes:
-    - name: created
-      columns: [created_at]
+    - name: k
+      columns: [k]
 
 run:
   update_columns:
-    - payload
+    - k
+    - c
 
 workload:
   transaction:
