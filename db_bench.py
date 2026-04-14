@@ -530,6 +530,17 @@ class LiveStats:
             if len(self.interval_latencies) < _MAX_INTERVAL_LAT_SAMPLES:
                 self.interval_latencies.append(ms)
 
+    def record_txn(self, ms: float, sel: int, ins: int, upd: int, dele: int) -> None:
+        """Record one committed transaction plus its statement mix in one lock section."""
+        with self._lock:
+            self.ops += 1
+            self.stmt_sel += sel
+            self.stmt_ins += ins
+            self.stmt_upd += upd
+            self.stmt_del += dele
+            if len(self.interval_latencies) < _MAX_INTERVAL_LAT_SAMPLES:
+                self.interval_latencies.append(ms)
+
     def record_error(self) -> None:
         with self._lock:
             self.errors += 1
@@ -749,6 +760,18 @@ def _pick_statement_template(
     tot = sum(t.weight for t in templates)
     if tot <= 0:
         raise SystemExit("internal error: template weights sum to 0")
+    return _pick_statement_template_with_total(u, templates, tot)
+
+
+def _pick_statement_template_with_total(
+    u: float,
+    templates: Tuple[StatementTemplate, ...],
+    total_weight: float,
+) -> StatementTemplate:
+    """Pick one template with a caller-provided precomputed total weight."""
+    tot = total_weight
+    if tot <= 0:
+        raise SystemExit("internal error: template weights sum to 0")
     r = u * tot
     for t in templates:
         r -= t.weight
@@ -837,9 +860,9 @@ def _bind_column_value(
     if col == "k":
         return randint(1, max(1, k_upper_bound))
     if col == "c":
-        return f"c{threading.get_ident()}-{time.time_ns()}"
+        return f"c{randint(0, 2_147_483_647)}"
     if col == "pad":
-        return f"p{threading.get_ident()}-{time.time_ns()}"
+        return f"p{randint(0, 2_147_483_647)}"
     ex = extra_by_name.get(col)
     if ex is None:
         raise RuntimeError(
@@ -850,7 +873,7 @@ def _bind_column_value(
     if k in ("int", "bigint"):
         return randint(0, 2_147_483_647)
     if k in ("text", "varchar"):
-        return f"u{col}-{threading.get_ident()}-{time.time_ns()}"
+        return f"u{col}-{randint(0, 2_147_483_647)}"
     raise RuntimeError(f"Unsupported extra column sql_kind for col: bind: {k!r}")
 
 
@@ -891,6 +914,24 @@ def _expand_bind_params(
     return tuple(out)
 
 
+def _compile_statement_template_sql(
+    tmpl: StatementTemplate,
+    tbl: str,
+    select_list_sql: str,
+) -> Tuple[str, int]:
+    """Render SQL for one table and validate bind arity once."""
+    assert tmpl.sql
+    sql = tmpl.sql.replace("{table}", tbl).replace("{select_list}", select_list_sql)
+    nph = _count_s_placeholders(sql)
+    exp_arity = _bind_expanded_arity(tmpl.bind)
+    if exp_arity != nph:
+        raise RuntimeError(
+            f"workload statement {tmpl.id!r}: bind expands to {exp_arity} %s value(s) "
+            f"but SQL has {nph} placeholder(s)"
+        )
+    return sql, nph
+
+
 def execute_statement_template(
     cur,
     tmpl: StatementTemplate,
@@ -901,18 +942,16 @@ def execute_statement_template(
     select_list_sql: str,
     workload_range_size: int,
     extra_by_name: Dict[str, ExtraColumn],
+    compiled_sql: Optional[str] = None,
+    placeholder_count: Optional[int] = None,
 ) -> None:
     """Run custom template SQL (``tmpl.sql`` non-empty) using declarative ``tmpl.bind``."""
     assert tmpl.sql
-    sql = tmpl.sql.replace("{table}", tbl).replace("{select_list}", select_list_sql)
-    nph = _count_s_placeholders(sql)
+    if compiled_sql is None or placeholder_count is None:
+        sql, nph = _compile_statement_template_sql(tmpl, tbl, select_list_sql)
+    else:
+        sql, nph = compiled_sql, placeholder_count
     bind = tmpl.bind
-    exp_arity = _bind_expanded_arity(bind)
-    if exp_arity != nph:
-        raise RuntimeError(
-            f"workload statement {tmpl.id!r}: bind expands to {exp_arity} %s value(s) "
-            f"but SQL has {nph} placeholder(s)"
-        )
     if nph == 0:
         cur.execute(sql)
     else:
@@ -947,18 +986,9 @@ def worker_loop(
     conn = None
     connect_fail_streak = 0
 
-    rnd = threading.local()
-
-    def _rng() -> random.Random:
-        if not hasattr(rnd, "g"):
-            rnd.g = random.Random()
-        return rnd.g
-
-    def rand() -> float:
-        return _rng().random()
-
-    def randint(a: int, b: int) -> int:
-        return _rng().randint(a, b)
+    rng = random.Random()
+    rand = rng.random
+    randint = rng.randint
 
     pk_hi = {t: initial_row_count for t in table_names}
     extra_by_name = {e.name: e for e in extra_columns}
@@ -967,6 +997,25 @@ def worker_loop(
     txn_multi = txn_mode == "multi"
     use_fixed_sequence = len(statement_sequence) > 0
     use_templates = len(statement_templates) > 0
+    sequence_templates: Tuple[StatementTemplate, ...] = tuple(
+        _sequence_step_to_template(step) for step in statement_sequence
+    ) if use_fixed_sequence else ()
+    template_total_weight = sum(t.weight for t in statement_templates) if use_templates else 0.0
+    if use_templates and template_total_weight <= 0:
+        raise SystemExit("internal error: template weights sum to 0")
+    compiled_sql_cache: Dict[Tuple[int, str], Tuple[str, int]] = {}
+
+    def _compiled_for(tmpl: StatementTemplate, tbl: str) -> Tuple[str, int]:
+        key = (id(tmpl), tbl)
+        got = compiled_sql_cache.get(key)
+        if got is None:
+            got = _compile_statement_template_sql(tmpl, tbl, select_list_sql)
+            compiled_sql_cache[key] = got
+        return got
+
+    run_builtin_stmt = backend.execute_workload_statement
+    begin_multi_txn = backend.begin_multi_statement_transaction
+    must_commit_single = backend.commit_after_each_statement_single_mode()
     connection_lost = False
     cur = None
 
@@ -1002,16 +1051,16 @@ def worker_loop(
             t0 = time.perf_counter()
             try:
                 if txn_multi:
-                    backend.begin_multi_statement_transaction(cur)
+                    begin_multi_txn(cur)
                     tbl = table_names[randint(0, nt - 1)]
                     ttop = pk_hi.get(tbl, 0)
                     txn_rid = randint(1, ttop) if ttop >= 1 else None
-                    stmt_ops: List[str] = []
+                    txn_sel = txn_ins = txn_upd = txn_del = 0
                     if use_fixed_sequence:
-                        for step in statement_sequence:
-                            tmpl = _sequence_step_to_template(step)
+                        for tmpl in sequence_templates:
                             op = tmpl.kind
                             if tmpl.sql:
+                                csql, nph = _compiled_for(tmpl, tbl)
                                 execute_statement_template(
                                     cur,
                                     tmpl,
@@ -1022,9 +1071,11 @@ def worker_loop(
                                     select_list_sql,
                                     range_size,
                                     extra_by_name,
+                                    csql,
+                                    nph,
                                 )
                             else:
-                                backend.execute_workload_statement(
+                                run_builtin_stmt(
                                     cur,
                                     op,
                                     tbl,
@@ -1035,13 +1086,25 @@ def worker_loop(
                                     extra_by_name,
                                     select_list_sql,
                                 )
-                            stmt_ops.append(op)
+                            if op == "select":
+                                txn_sel += 1
+                            elif op == "insert":
+                                txn_ins += 1
+                            elif op == "update":
+                                txn_upd += 1
+                            else:
+                                txn_del += 1
                     else:
                         for _ in range(txn_statements):
                             if use_templates:
-                                tmpl = _pick_statement_template(rand(), statement_templates)
+                                tmpl = _pick_statement_template_with_total(
+                                    rand(),
+                                    statement_templates,
+                                    template_total_weight,
+                                )
                                 op = tmpl.kind
                                 if tmpl.sql:
+                                    csql, nph = _compiled_for(tmpl, tbl)
                                     execute_statement_template(
                                         cur,
                                         tmpl,
@@ -1052,9 +1115,11 @@ def worker_loop(
                                         select_list_sql,
                                         range_size,
                                         extra_by_name,
+                                        csql,
+                                        nph,
                                     )
                                 else:
-                                    backend.execute_workload_statement(
+                                    run_builtin_stmt(
                                         cur,
                                         op,
                                         tbl,
@@ -1067,7 +1132,7 @@ def worker_loop(
                                     )
                             else:
                                 op = _pick_crud_op(rand(), txn_crud)
-                                backend.execute_workload_statement(
+                                run_builtin_stmt(
                                     cur,
                                     op,
                                     tbl,
@@ -1078,14 +1143,24 @@ def worker_loop(
                                     extra_by_name,
                                     select_list_sql,
                                 )
-                            stmt_ops.append(op)
+                            if op == "select":
+                                txn_sel += 1
+                            elif op == "insert":
+                                txn_ins += 1
+                            elif op == "update":
+                                txn_upd += 1
+                            else:
+                                txn_del += 1
                     conn.commit()
                 else:
                     tbl = table_names[randint(0, nt - 1)]
                     if use_templates:
-                        tmpl = _pick_statement_template(rand(), statement_templates)
+                        tmpl = _pick_statement_template_with_total(
+                            rand(), statement_templates, template_total_weight
+                        )
                         op = tmpl.kind
                         if tmpl.sql:
+                            csql, nph = _compiled_for(tmpl, tbl)
                             execute_statement_template(
                                 cur,
                                 tmpl,
@@ -1096,9 +1171,11 @@ def worker_loop(
                                 select_list_sql,
                                 range_size,
                                 extra_by_name,
+                                csql,
+                                nph,
                             )
                         else:
-                            backend.execute_workload_statement(
+                            run_builtin_stmt(
                                 cur,
                                 op,
                                 tbl,
@@ -1111,7 +1188,7 @@ def worker_loop(
                             )
                     else:
                         op = _pick_crud_op(rand(), crud)
-                        backend.execute_workload_statement(
+                        run_builtin_stmt(
                             cur,
                             op,
                             tbl,
@@ -1122,23 +1199,24 @@ def worker_loop(
                             extra_by_name,
                             select_list_sql,
                         )
-                    if backend.commit_after_each_statement_single_mode():
+                    if must_commit_single:
                         conn.commit()
                 ms = (time.perf_counter() - t0) * 1000.0
                 result.ops += 1
                 result.latencies_ms.append(ms)
                 if txn_multi:
-                    for o in stmt_ops:
-                        result.add_stmt(o)
+                    result.stmt_sel += txn_sel
+                    result.stmt_ins += txn_ins
+                    result.stmt_upd += txn_upd
+                    result.stmt_del += txn_del
                 else:
                     result.add_stmt(op)
                 if live is not None:
                     if txn_multi:
-                        for o in stmt_ops:
-                            live.record_stmt(o)
+                        live.record_txn(ms, txn_sel, txn_ins, txn_upd, txn_del)
                     else:
                         live.record_stmt(op)
-                    live.record_op(ms)
+                        live.record_op(ms)
             except Exception as e:
                 result.errors += 1
                 if live is not None:

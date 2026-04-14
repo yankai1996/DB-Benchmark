@@ -1,9 +1,6 @@
 """Database backend abstract base for db_bench (prepare + run workload)."""
 
 from __future__ import annotations
-
-import threading
-import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
@@ -89,10 +86,10 @@ class Backend(ABC):
                 params.append(randint(1, k_hi))
             elif col == "c":
                 parts.append("c = %s")
-                params.append(f"c{threading.get_ident()}-{time.time_ns()}")
+                params.append(f"c{randint(0, 2_147_483_647)}")
             elif col == "pad":
                 parts.append("pad = %s")
-                params.append(f"p{threading.get_ident()}-{time.time_ns()}")
+                params.append(f"p{randint(0, 2_147_483_647)}")
             else:
                 ex = extra_by_name.get(col)
                 if ex is None:
@@ -106,7 +103,7 @@ class Backend(ABC):
                     params.append(randint(0, 2_147_483_647))
                 elif k in ("text", "varchar"):
                     parts.append(f"{col} = %s")
-                    params.append(f"u{col}-{threading.get_ident()}-{time.time_ns()}")
+                    params.append(f"u{col}-{randint(0, 2_147_483_647)}")
                 else:
                     raise SystemExit(f"Unsupported extra column sql_kind for UPDATE: {k!r}")
         return parts, params
@@ -150,8 +147,8 @@ class Backend(ABC):
                 cur.fetchone()
         elif op == "insert":
             k = randint(1, max(1, top))
-            c = f"c{threading.get_ident()}-{time.time_ns()}"
-            pad = f"p{threading.get_ident()}-{time.time_ns()}"
+            c = f"c{randint(0, 2_147_483_647)}"
+            pad = f"p{randint(0, 2_147_483_647)}"
             new_id = self.run_insert_returning_id(cur, tbl, k, c, pad)
             if new_id is not None and new_id > pk_hi[tbl]:
                 pk_hi[tbl] = new_id
