@@ -376,7 +376,7 @@ function prepare()
   ensure_connection()
   for i = 1, local_cfg.tables do
     local tbl = table_name_by_index(local_cfg.table_name, i, local_cfg.tables)
-    sysbench.log_info("prepare table: " .. tbl)
+    print("prepare table: " .. tbl)
     prepare_single_table(tbl, local_cfg)
   end
 end
