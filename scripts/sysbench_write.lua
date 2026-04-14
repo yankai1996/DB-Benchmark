@@ -8,7 +8,7 @@ local DEFAULT_TABLES = 1
 local DEFAULT_TABLE_SIZE = 180000000
 local DEFAULT_COLUMN_COUNT = 4
 local DEFAULT_SELECT_COL_COUNT = DEFAULT_COLUMN_COUNT
-local DEFAULT_UPDATE_COL_COUNT = DEFAULT_COLUMN_COUNT
+local DEFAULT_UPDATE_COL_COUNT = 1
 local DEFAULT_INSERT_COL_COUNT = DEFAULT_COLUMN_COUNT
 local DEFAULT_WORKLOAD_MODE = "batch_update_by_pk"
 local DEFAULT_ROWS_PER_UPDATE = 500
@@ -38,6 +38,7 @@ sysbench.cmdline.options = {
 local cfg = nil
 local drv = nil
 local con = nil
+local config_logged = false
 
 local function fail(msg)
   error("sysbench_write.lua: " .. msg)
@@ -456,8 +457,31 @@ local function dispatch_workload(tbl, local_cfg)
   end
 end
 
+local function maybe_log_runtime_config(local_cfg)
+  if config_logged then
+    return
+  end
+  local tid = tonumber(sysbench.tid or 0)
+  if tid ~= 0 then
+    return
+  end
+  print(
+    string.format(
+      "runtime config: workload_mode=%s prepare_mode=%s rows_per_update=%d update_col_count=%d select_col_count=%d insert_col_count=%d",
+      tostring(local_cfg.workload_mode),
+      tostring(local_cfg.prepare_mode),
+      tonumber(local_cfg.rows_per_update),
+      tonumber(local_cfg.update_col_count),
+      tonumber(local_cfg.select_col_count),
+      tonumber(local_cfg.insert_col_count)
+    )
+  )
+  config_logged = true
+end
+
 function thread_init()
-  build_config()
+  local local_cfg = build_config()
+  maybe_log_runtime_config(local_cfg)
   ensure_connection()
 end
 

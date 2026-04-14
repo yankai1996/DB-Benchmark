@@ -22,7 +22,7 @@ Pass options after the script path, for example `--column_count=8`.
 - `table_size` (default: `180000000`)
 - `column_count` (default: `4`)
 - `select_col_count` (default: `column_count`, uses first N cols for select)
-- `update_col_count` (default: `column_count`, uses first N cols for update)
+- `update_col_count` (default: `1`, uses first N cols for update)
 - `insert_col_count` (default: `column_count`, uses first N cols for insert)
 - `workload_mode` (default: `batch_update_by_pk`)
 - `rows_per_update` (default: `500`)
