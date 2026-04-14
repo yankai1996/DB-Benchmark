@@ -11,6 +11,7 @@ the root project README workflow.
   - column types alternate from `col1`: `INT`, `CHAR(20)`, `INT`, `CHAR(20)`...
   - default workload mode: `batch_update_by_pk`
   - each event runs `rows_per_update` updates with random, non-repeated PKs
+  - in `prepare`, `CHAR(20)` columns use a fixed value for faster data loading
 
 ## Parameters (Lua options)
 

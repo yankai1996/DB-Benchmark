@@ -17,6 +17,7 @@ local DEFAULT_INSERT_BATCH_SIZE = 1000
 local RAND_INT_MAX = 2147483647
 local STR_LEN = 20
 local STR_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+local PREPARE_FIXED_CHAR20 = "AAAAAAAAAAAAAAAAAAAA"
 
 sysbench.cmdline.options = {
   table_name = {"Table name (or stem when tables > 1).", DEFAULT_TABLE_NAME},
@@ -117,6 +118,13 @@ local function column_random_sql_value(i)
     return tostring(sysbench.rand.uniform(1, RAND_INT_MAX))
   end
   return sql_quote(random_char20())
+end
+
+local function column_prepare_sql_value(i)
+  if column_kind(i) == "int" then
+    return tostring(sysbench.rand.uniform(1, RAND_INT_MAX))
+  end
+  return sql_quote(PREPARE_FIXED_CHAR20)
 end
 
 local function clamp_count(v, max_v)
@@ -233,7 +241,7 @@ end
 local function build_prepare_values_row(local_cfg)
   local vals = {}
   for i = 1, local_cfg.column_count do
-    vals[#vals + 1] = column_random_sql_value(i)
+    vals[#vals + 1] = column_prepare_sql_value(i)
   end
   return "(" .. table.concat(vals, ", ") .. ")"
 end
