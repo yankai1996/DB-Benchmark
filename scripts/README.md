@@ -27,7 +27,7 @@ Pass options after the script path, for example `--column_count=8`.
 - `workload_mode` (default: `batch_update_by_pk`)
 - `rows_per_update` (default: `500`)
 - `write_weights` (default: `0,1,0`, format: `insert,update,delete`)
-- `insert_batch_size` (default: `1000`, used in `prepare`)
+- `insert_batch_size` (default: `10000`, used in `prepare`)
 - `prepare_mode` (default: `sql_generate`, options: `lua_values`, `sql_generate`)
 
 When `*_col_count` is larger than `column_count`, it is clamped to `column_count`.
