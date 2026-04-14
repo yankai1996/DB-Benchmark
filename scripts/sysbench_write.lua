@@ -14,6 +14,7 @@ local DEFAULT_WORKLOAD_MODE = "batch_update_by_pk"
 local DEFAULT_ROWS_PER_UPDATE = 10
 local DEFAULT_WRITE_WEIGHTS = "0,1,0" -- insert,update,delete
 local DEFAULT_INSERT_BATCH_SIZE = 1000
+local DEFAULT_PREPARE_MODE = "lua_values"
 local RAND_INT_MAX = 2147483647
 local STR_LEN = 20
 local STR_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -30,7 +31,8 @@ sysbench.cmdline.options = {
   workload_mode = {"Workload mode: batch_update_by_pk|mixed_write.", DEFAULT_WORKLOAD_MODE},
   rows_per_update = {"UPDATE statements per event (unique PKs).", DEFAULT_ROWS_PER_UPDATE},
   write_weights = {"insert,update,delete integer weights.", DEFAULT_WRITE_WEIGHTS},
-  insert_batch_size = {"Rows per INSERT VALUES batch in prepare.", DEFAULT_INSERT_BATCH_SIZE}
+  insert_batch_size = {"Rows per INSERT VALUES batch in prepare.", DEFAULT_INSERT_BATCH_SIZE},
+  prepare_mode = {"Prepare mode: lua_values|sql_generate.", DEFAULT_PREPARE_MODE}
 }
 
 local cfg = nil
@@ -158,6 +160,7 @@ local function build_config()
   local column_count = parse_int("column_count", sysbench.opt.column_count, 1)
   local rows_per_update = parse_int("rows_per_update", sysbench.opt.rows_per_update, 1)
   local insert_batch_size = parse_int("insert_batch_size", sysbench.opt.insert_batch_size, 1)
+  local prepare_mode = tostring(sysbench.opt.prepare_mode or DEFAULT_PREPARE_MODE)
   local select_col_count = parse_int("select_col_count", sysbench.opt.select_col_count, 0)
   local update_col_count = parse_int("update_col_count", sysbench.opt.update_col_count, 1)
   local insert_col_count = parse_int("insert_col_count", sysbench.opt.insert_col_count, 1)
@@ -165,6 +168,9 @@ local function build_config()
 
   if workload_mode ~= "batch_update_by_pk" and workload_mode ~= "mixed_write" then
     fail("workload_mode must be one of: batch_update_by_pk, mixed_write")
+  end
+  if prepare_mode ~= "lua_values" and prepare_mode ~= "sql_generate" then
+    fail("prepare_mode must be one of: lua_values, sql_generate")
   end
   if rows_per_update > table_size then
     fail("rows_per_update cannot exceed table_size when PKs must be unique per event")
@@ -181,6 +187,7 @@ local function build_config()
     table_size = table_size,
     column_count = column_count,
     workload_mode = workload_mode,
+    prepare_mode = prepare_mode,
     rows_per_update = rows_per_update,
     select_col_count = select_col_count,
     update_col_count = update_col_count,
@@ -246,19 +253,98 @@ local function build_prepare_values_row(local_cfg)
   return "(" .. table.concat(vals, ", ") .. ")"
 end
 
+local function build_digits_derived_sql()
+  return "(SELECT 0 AS d UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 " ..
+    "UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9)"
+end
+
+local function build_series_from_clause(n)
+  local need = n
+  local k = 0
+  while need > 0 do
+    k = k + 1
+    need = math.floor(need / 10)
+  end
+  if k < 1 then
+    k = 1
+  end
+  local digits = build_digits_derived_sql()
+  local parts = {}
+  for i = 1, k do
+    parts[#parts + 1] = digits .. " d" .. tostring(i)
+  end
+  return table.concat(parts, " CROSS JOIN "), k
+end
+
+local function build_series_rownum_expr(k)
+  local terms = {}
+  local mul = 1
+  for i = 1, k do
+    terms[#terms + 1] = tostring(mul) .. " * d" .. tostring(i) .. ".d"
+    mul = mul * 10
+  end
+  return "(" .. table.concat(terms, " + ") .. ")"
+end
+
+local function build_prepare_select_exprs_sql_generated(local_cfg)
+  local exprs = {}
+  for i = 1, local_cfg.column_count do
+    if column_kind(i) == "int" then
+      local a = i * 37 + 11
+      local b = i * 17 + 3
+      exprs[#exprs + 1] = string.format(
+        "CAST(((seq.rn * %d + %d) %% %d) + 1 AS UNSIGNED)",
+        a,
+        b,
+        RAND_INT_MAX
+      )
+    else
+      exprs[#exprs + 1] = sql_quote(PREPARE_FIXED_CHAR20)
+    end
+  end
+  return table.concat(exprs, ", ")
+end
+
+local function build_prepare_insert_sql_generated(tbl, cols_sql, n, local_cfg)
+  local from_sql, k = build_series_from_clause(n)
+  local rownum_expr = build_series_rownum_expr(k)
+  local select_exprs = build_prepare_select_exprs_sql_generated(local_cfg)
+  return string.format(
+    "INSERT INTO %s (%s) SELECT %s FROM (" ..
+      "SELECT %s + 1 AS rn FROM %s LIMIT %d" ..
+    ") seq",
+    tbl,
+    cols_sql,
+    select_exprs,
+    rownum_expr,
+    from_sql,
+    n
+  )
+end
+
 local function prepare_single_table(tbl, local_cfg)
   con:query(build_create_table_sql(tbl, local_cfg))
 
   local inserted = 0
   local all_cols = build_first_n_columns(local_cfg.column_count)
   local cols_sql = table.concat(all_cols, ", ")
+  local generated_sql_cache = {}
   while inserted < local_cfg.table_size do
     local n = math.min(local_cfg.insert_batch_size, local_cfg.table_size - inserted)
-    local values = {}
-    for _ = 1, n do
-      values[#values + 1] = build_prepare_values_row(local_cfg)
+    local sql
+    if local_cfg.prepare_mode == "sql_generate" then
+      sql = generated_sql_cache[n]
+      if sql == nil then
+        sql = build_prepare_insert_sql_generated(tbl, cols_sql, n, local_cfg)
+        generated_sql_cache[n] = sql
+      end
+    else
+      local values = {}
+      for _ = 1, n do
+        values[#values + 1] = build_prepare_values_row(local_cfg)
+      end
+      sql = string.format("INSERT INTO %s (%s) VALUES %s", tbl, cols_sql, table.concat(values, ", "))
     end
-    local sql = string.format("INSERT INTO %s (%s) VALUES %s", tbl, cols_sql, table.concat(values, ", "))
     con:query(sql)
     inserted = inserted + n
   end
