@@ -108,6 +108,35 @@ def extract_config_path(argv: List[str]) -> Tuple[Optional[str], List[str]]:
     return cfg, out
 
 
+def extract_cli_model_override(argv: List[str]) -> Tuple[Optional[str], List[str]]:
+    """If argv contains ``--model PATH`` (last wins), return (path, argv with those tokens removed).
+
+    Parsed before the main ArgumentParser so ``merged['model']`` matches the CLI when applying
+    workload defaults from the model YAML (``apply_model_workload_to_merged``).
+    """
+    out: List[str] = []
+    i = 0
+    last: Optional[str] = None
+    while i < len(argv):
+        a = argv[i]
+        if a == "--model":
+            if i + 1 >= len(argv):
+                raise SystemExit("--model requires a path")
+            last = argv[i + 1]
+            i += 2
+            continue
+        if a.startswith("--model="):
+            val = a.split("=", 1)[1]
+            if not val:
+                raise SystemExit("--model= requires a non-empty path")
+            last = val
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return last, out
+
+
 def _coerce_config_value(key: str, val: object) -> object:
     return val
 
@@ -1519,6 +1548,9 @@ def main() -> None:
     if cfg_path:
         file_cfg = normalize_config_mapping(load_config_file(cfg_path))
     merged: Dict[str, Any] = merge_config_with_program_defaults(file_cfg)
+    model_cli, argv_rest = extract_cli_model_override(argv_rest)
+    if model_cli is not None:
+        merged["model"] = model_cli
     bm = resolve_bench_model(str(merged.get("model") or ""))
     apply_model_workload_to_merged(merged, bm.workload)
     args = build_argument_parser(merged).parse_args(argv_rest)
