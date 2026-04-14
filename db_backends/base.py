@@ -33,6 +33,10 @@ class Backend(ABC):
         """Return a live DB-API connection."""
 
     @abstractmethod
+    def table_exists(self, cur, table: str) -> bool:
+        """True if a relation named ``table`` exists in the current database/search_path."""
+
+    @abstractmethod
     def is_connection_error(self, exc: BaseException) -> bool:
         """True if the session should be discarded (reconnect)."""
 

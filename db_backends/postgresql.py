@@ -29,6 +29,18 @@ class PostgreSQLBackend(Backend):
 
         return isinstance(exc, (psycopg2.OperationalError, psycopg2.InterfaceError))
 
+    def table_exists(self, cur, table: str) -> bool:
+        cur.execute(
+            """
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = ANY (current_schemas(false))
+              AND table_name = %s
+            LIMIT 1
+            """,
+            (table.lower(),),
+        )
+        return cur.fetchone() is not None
+
     def default_ddl(self, table: str) -> str:
         return f"""
         CREATE TABLE IF NOT EXISTS {table} (

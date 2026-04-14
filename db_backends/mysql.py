@@ -35,6 +35,17 @@ class MySQLBackend(Backend):
 
         return isinstance(exc, (pymysql.err.OperationalError, pymysql.err.InterfaceError))
 
+    def table_exists(self, cur, table: str) -> bool:
+        cur.execute(
+            """
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = DATABASE() AND table_name = %s
+            LIMIT 1
+            """,
+            (table,),
+        )
+        return cur.fetchone() is not None
+
     def default_ddl(self, table: str) -> str:
         return f"""
     CREATE TABLE IF NOT EXISTS {table} (

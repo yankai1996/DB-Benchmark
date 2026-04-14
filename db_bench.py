@@ -630,6 +630,37 @@ def physical_table_names(stem: str, num_tables: int) -> List[str]:
     return names
 
 
+def _preflight_run_checks(
+    backend: Backend,
+    kwargs: dict,
+    table_names: List[str],
+    *,
+    table_stem: str,
+    tables_count: int,
+) -> None:
+    """Connect once and verify benchmark tables exist; exit the process on failure."""
+    try:
+        conn = backend.connect(kwargs)
+    except Exception as e:
+        raise SystemExit(f"Cannot connect to the database: {e}") from e
+    try:
+        cur = conn.cursor()
+        missing = [t for t in table_names if not backend.table_exists(cur, t)]
+        if missing:
+            raise SystemExit(
+                "Benchmark table(s) missing: "
+                + ", ".join(repr(t) for t in missing)
+                + ". Run `prepare` first (same --url, --model, --table, --tables "
+                f"as this run). Example: db_bench.py prepare --url '...' --table {table_stem!r} "
+                f"--tables {tables_count}"
+            )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def prepare_benchmark(
     conn,
     backend: Backend,
@@ -1388,6 +1419,12 @@ def cmd_run(args: argparse.Namespace) -> None:
                 f"(got {args.txn_statements})"
             )
 
+    url = _require_db_url(args.url)
+    scheme, kwargs = parse_db_url(url)
+    backend = get_backend(scheme)
+    table_names = physical_table_names(args.table, args.tables)
+    _preflight_run_checks(backend, kwargs, table_names, table_stem=args.table, tables_count=args.tables)
+
     s, ins, upd, dele = (
         args.select_ratio,
         args.insert_ratio,
@@ -1411,7 +1448,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     ts, tins, tupd, tdel = normalize_crud_ratios(ts, tins, tupd, tdel)
 
     cfg = BenchConfig(
-        url=_require_db_url(args.url),
+        url=url,
         workers=max(1, args.workers),
         duration_sec=max(0.01, args.duration),
         select_ratio=s,
