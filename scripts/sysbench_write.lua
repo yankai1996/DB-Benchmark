@@ -3,18 +3,18 @@
 -- Standalone MySQL/MariaDB workload script.
 -- Default mode: batch_update_by_pk with unique random PKs per event.
 
-local DEFAULT_TABLE_NAME = "sbtest_custom"
+local DEFAULT_TABLE_NAME = "sbtest"
 local DEFAULT_TABLES = 1
-local DEFAULT_TABLE_SIZE = 10000
+local DEFAULT_TABLE_SIZE = 180000000
 local DEFAULT_COLUMN_COUNT = 4
 local DEFAULT_SELECT_COL_COUNT = DEFAULT_COLUMN_COUNT
 local DEFAULT_UPDATE_COL_COUNT = DEFAULT_COLUMN_COUNT
 local DEFAULT_INSERT_COL_COUNT = DEFAULT_COLUMN_COUNT
 local DEFAULT_WORKLOAD_MODE = "batch_update_by_pk"
-local DEFAULT_ROWS_PER_UPDATE = 10
+local DEFAULT_ROWS_PER_UPDATE = 500
 local DEFAULT_WRITE_WEIGHTS = "0,1,0" -- insert,update,delete
 local DEFAULT_INSERT_BATCH_SIZE = 1000
-local DEFAULT_PREPARE_MODE = "lua_values"
+local DEFAULT_PREPARE_MODE = "sql_generate"
 local RAND_INT_MAX = 2147483647
 local STR_LEN = 20
 local STR_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"

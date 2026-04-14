@@ -17,18 +17,18 @@ the root project README workflow.
 
 Pass options after the script path, for example `--column_count=8`.
 
-- `table_name` (default: `sbtest_custom`)
+- `table_name` (default: `sbtest`)
 - `tables` (default: `1`)
-- `table_size` (default: `10000`)
+- `table_size` (default: `180000000`)
 - `column_count` (default: `4`)
 - `select_col_count` (default: `column_count`, uses first N cols for select)
 - `update_col_count` (default: `column_count`, uses first N cols for update)
 - `insert_col_count` (default: `column_count`, uses first N cols for insert)
 - `workload_mode` (default: `batch_update_by_pk`)
-- `rows_per_update` (default: `10`)
+- `rows_per_update` (default: `500`)
 - `write_weights` (default: `0,1,0`, format: `insert,update,delete`)
 - `insert_batch_size` (default: `1000`, used in `prepare`)
-- `prepare_mode` (default: `lua_values`, options: `lua_values`, `sql_generate`)
+- `prepare_mode` (default: `sql_generate`, options: `lua_values`, `sql_generate`)
 
 When `*_col_count` is larger than `column_count`, it is clamped to `column_count`.
 
