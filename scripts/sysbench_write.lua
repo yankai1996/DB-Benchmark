@@ -1,6 +1,7 @@
 #!/usr/bin/env sysbench
 
--- Standalone MySQL/MariaDB workload script.
+-- Standalone workload script for MySQL/MariaDB and PostgreSQL.
+-- Use --db-driver=mysql or --db-driver=pgsql (same script).
 -- Default mode: batch_update_by_pk with unique random PKs per event.
 
 local DEFAULT_TABLE_NAME = "sbtest"
@@ -148,11 +149,27 @@ local function build_first_n_columns(n)
   return cols
 end
 
+local function get_db_kind()
+  local raw = sysbench.opt.db_driver or sysbench.opt["db-driver"]
+  if raw == nil or tostring(raw) == "" then
+    return "mysql"
+  end
+  raw = string.lower(tostring(raw))
+  if raw == "pgsql" or raw == "postgresql" or raw == "pg" then
+    return "pgsql"
+  end
+  if raw == "mysql" or raw == "mariadb" then
+    return "mysql"
+  end
+  fail("unsupported db_driver: " .. tostring(raw) .. " (use mysql or pgsql)")
+end
+
 local function build_config()
   if cfg ~= nil then
     return cfg
   end
 
+  local db_kind = get_db_kind()
   local table_name = tostring(sysbench.opt.table_name)
   validate_identifier(table_name, "table_name")
 
@@ -183,6 +200,7 @@ local function build_config()
 
   local weights = parse_weights(tostring(sysbench.opt.write_weights))
   cfg = {
+    db_kind = db_kind,
     table_name = table_name,
     tables = tables,
     table_size = table_size,
@@ -234,7 +252,12 @@ local function random_table_name(local_cfg)
 end
 
 local function build_create_table_sql(tbl, local_cfg)
-  local defs = {"id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY"}
+  local defs
+  if local_cfg.db_kind == "pgsql" then
+    defs = {"id BIGSERIAL PRIMARY KEY"}
+  else
+    defs = {"id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY"}
+  end
   for i = 1, local_cfg.column_count do
     local c = column_name(i)
     if column_kind(i) == "int" then
@@ -287,7 +310,7 @@ local function build_series_rownum_expr(k)
   return "(" .. table.concat(terms, " + ") .. ")"
 end
 
-local function build_prepare_select_exprs_sql_generated(local_cfg)
+local function build_prepare_select_exprs_sql_generated_mysql(local_cfg)
   local exprs = {}
   for i = 1, local_cfg.column_count do
     if column_kind(i) == "int" then
@@ -306,10 +329,39 @@ local function build_prepare_select_exprs_sql_generated(local_cfg)
   return table.concat(exprs, ", ")
 end
 
+local function build_prepare_select_exprs_sql_generated_pgsql(local_cfg)
+  local exprs = {}
+  for i = 1, local_cfg.column_count do
+    if column_kind(i) == "int" then
+      local a = i * 37 + 11
+      local b = i * 17 + 3
+      exprs[#exprs + 1] = string.format(
+        "CAST(((rn * %d + %d) %% %d) + 1 AS INTEGER)",
+        a,
+        b,
+        RAND_INT_MAX
+      )
+    else
+      exprs[#exprs + 1] = sql_quote(PREPARE_FIXED_CHAR20) .. "::char(20)"
+    end
+  end
+  return table.concat(exprs, ", ")
+end
+
 local function build_prepare_insert_sql_generated(tbl, cols_sql, n, local_cfg)
+  if local_cfg.db_kind == "pgsql" then
+    local select_exprs = build_prepare_select_exprs_sql_generated_pgsql(local_cfg)
+    return string.format(
+      "INSERT INTO %s (%s) SELECT %s FROM generate_series(1, %d) AS seq(rn)",
+      tbl,
+      cols_sql,
+      select_exprs,
+      n
+    )
+  end
   local from_sql, k = build_series_from_clause(n)
   local rownum_expr = build_series_rownum_expr(k)
-  local select_exprs = build_prepare_select_exprs_sql_generated(local_cfg)
+  local select_exprs = build_prepare_select_exprs_sql_generated_mysql(local_cfg)
   return string.format(
     "INSERT INTO %s (%s) SELECT %s FROM (" ..
       "SELECT %s + 1 AS rn FROM %s LIMIT %d" ..
@@ -334,10 +386,11 @@ local function prepare_single_table(tbl, local_cfg)
     local n = math.min(local_cfg.insert_batch_size, local_cfg.table_size - inserted)
     local sql
     if local_cfg.prepare_mode == "sql_generate" then
-      sql = generated_sql_cache[n]
+      local cache_key = local_cfg.db_kind .. ":" .. tostring(n)
+      sql = generated_sql_cache[cache_key]
       if sql == nil then
         sql = build_prepare_insert_sql_generated(tbl, cols_sql, n, local_cfg)
-        generated_sql_cache[n] = sql
+        generated_sql_cache[cache_key] = sql
       end
     else
       local values = {}
@@ -389,7 +442,11 @@ end
 
 local function op_insert_one(tbl, local_cfg)
   if #local_cfg.insert_columns == 0 then
-    con:query("INSERT INTO " .. tbl .. " () VALUES ()")
+    if local_cfg.db_kind == "pgsql" then
+      con:query("INSERT INTO " .. tbl .. " DEFAULT VALUES")
+    else
+      con:query("INSERT INTO " .. tbl .. " () VALUES ()")
+    end
     return
   end
   local vals = {}
@@ -467,7 +524,8 @@ local function maybe_log_runtime_config(local_cfg)
   end
   print(
     string.format(
-      "runtime config: workload_mode=%s prepare_mode=%s rows_per_update=%d update_col_count=%d select_col_count=%d insert_col_count=%d",
+      "runtime config: db_kind=%s workload_mode=%s prepare_mode=%s rows_per_update=%d update_col_count=%d select_col_count=%d insert_col_count=%d",
+      tostring(local_cfg.db_kind),
       tostring(local_cfg.workload_mode),
       tostring(local_cfg.prepare_mode),
       tonumber(local_cfg.rows_per_update),
