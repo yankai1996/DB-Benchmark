@@ -12,6 +12,34 @@ the root project README workflow.
   - default workload mode: `batch_update_by_pk`
   - each event runs `rows_per_update` updates with random, non-repeated PKs
   - in `prepare`, `CHAR(20)` columns use a fixed value for faster data loading
+- `sysbench_txn_fixed.lua`: fixed transaction script for **MySQL/MariaDB** or **PostgreSQL**
+  - one `event` = one transaction
+  - executes a fixed SQL sequence in order (`BEGIN -> SQL1..SQLN -> COMMIT`)
+  - on any SQL failure it runs `ROLLBACK` and surfaces the error
+  - SQL list is configured in script constant `FIXED_TXN_SQL`
+  - supports `{table}` placeholder via `--table_name`
+
+## Fixed Transaction Script Quick Start
+
+Edit `scripts/sysbench_txn_fixed.lua` and replace `FIXED_TXN_SQL` with your real
+business transaction SQL sequence.
+
+Example run:
+
+```bash
+sysbench \
+  --db-driver=mysql \
+  --mysql-host=127.0.0.1 \
+  --mysql-port=3306 \
+  --mysql-user=root \
+  --mysql-password=secret \
+  --mysql-db=test \
+  --threads=16 \
+  --time=60 \
+  scripts/sysbench_txn_fixed.lua \
+  --table_name=sbtest \
+  run
+```
 
 ## Parameters (Lua options)
 
