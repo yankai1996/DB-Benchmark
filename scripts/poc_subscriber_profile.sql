@@ -1,9 +1,9 @@
 -- POC wide table DDL for subscriber_profile (MySQL)
--- Charset utf8mb4; msisdn primary key; BOOLEAN/DATETIME/VARCHAR defaults per POC schema.
+-- Charset utf8mb4; msisdn BIGINT AUTO_INCREMENT primary key; BOOLEAN/DATETIME/VARCHAR defaults per POC schema.
 -- VARCHAR defaults: first Sample token (comma=enum), truncate to n; empty Sample -> 'a'; no right-padding.
 
 CREATE TABLE IF NOT EXISTS subscriber_profile (
-  `msisdn` BIGINT NOT NULL,
+  `msisdn` BIGINT NOT NULL AUTO_INCREMENT,
   `flag_attached` BOOLEAN NOT NULL DEFAULT FALSE,
   `balance` INT NOT NULL DEFAULT 0,
   `vol_datapack_remain` INT NOT NULL DEFAULT 0,
